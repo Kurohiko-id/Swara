@@ -226,19 +226,26 @@ pub fn raw_key_event(lp: LPARAM) -> Option<(u32, bool)> {
 /// so each vk counts once until it is released.
 /// Per WM_INPUT the core calls `press`, `match_raw`, then `past_dedup`; the dedup timestamp
 /// is shared with WM_HOTKEY.
+/// A key-up can get lost (Win+L, UAC). Auto-repeat resends key-down well within this gap, so a
+/// longer silence means the key was released and this is a new press.
 #[derive(Default)]
-pub struct RawHeld(Vec<u32>);
+pub struct RawHeld(Vec<(u32, Instant)>);
+
+/// FilterKeys allows repeat delay and rate up to 2 s, so the gap stays well above that.
+pub const HELD_STALE: Duration = Duration::from_secs(5);
 
 impl RawHeld {
-    pub fn press(&mut self, vk: u32, down: bool) -> bool {
+    pub fn press(&mut self, vk: u32, down: bool, now: Instant) -> bool {
         if !down {
-            self.0.retain(|&held| held != vk);
+            self.0.retain(|&(held, _)| held != vk);
             return false;
         }
-        if self.0.contains(&vk) {
-            return false;
+        if let Some((_, seen)) = self.0.iter_mut().find(|(held, _)| *held == vk) {
+            let repeat = now.duration_since(*seen) < HELD_STALE;
+            *seen = now;
+            return !repeat;
         }
-        self.0.push(vk);
+        self.0.push((vk, now));
         true
     }
 }
@@ -389,17 +396,33 @@ mod tests {
     #[test]
     fn held_key_counts_once_until_released() {
         let mut held = RawHeld::default();
-        assert!(held.press(0x6B, true));
-        assert!(!held.press(0x6B, true));
-        assert!(!held.press(0x6B, true));
-        assert!(!held.press(0x6B, false));
-        assert!(held.press(0x6B, true));
-        assert!(held.press(0x4B, true));
-        assert!(!held.press(0x4B, true));
-        assert!(!held.press(0x6B, true));
-        assert!(!held.press(0x4B, false));
-        assert!(!held.press(0x6B, true));
-        assert!(held.press(0x4B, true));
+        let now = Instant::now();
+        let mut press = |vk, down| held.press(vk, down, now);
+        assert!(press(0x6B, true));
+        assert!(!press(0x6B, true));
+        assert!(!press(0x6B, true));
+        assert!(!press(0x6B, false));
+        assert!(press(0x6B, true));
+        assert!(press(0x4B, true));
+        assert!(!press(0x4B, true));
+        assert!(!press(0x6B, true));
+        assert!(!press(0x4B, false));
+        assert!(!press(0x6B, true));
+        assert!(press(0x4B, true));
+    }
+
+    #[test]
+    fn lost_key_up_does_not_block_the_next_press() {
+        let mut held = RawHeld::default();
+        let t0 = Instant::now();
+        assert!(held.press(0x6B, true, t0));
+        // Auto-repeat keeps the key fresh, however long it is held.
+        assert!(!held.press(0x6B, true, t0 + ms(900)));
+        assert!(!held.press(0x6B, true, t0 + ms(1_800)));
+        // FilterKeys' slowest repeat is 2 s apart.
+        assert!(!held.press(0x6B, true, t0 + ms(3_800)));
+        // The key-up never came (e.g. Win+L); a press after a silent gap is new.
+        assert!(held.press(0x6B, true, t0 + ms(3_800) + HELD_STALE));
     }
 
     #[test]

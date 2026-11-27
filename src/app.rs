@@ -1,5 +1,6 @@
 //! Core process: one hidden window that owns hotkeys, the tray, the guard and the popups.
 
+use crate::admin;
 use crate::audio::{self, Audio, Current, Flow, Roles, WM_APP_DEVICES};
 use crate::autostart;
 use crate::config::{self, Config, DeviceRef, GuardSide, Hotkey, LoadOutcome};
@@ -23,13 +24,15 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateMutexW, CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_PROCESS_LOGON_FLAGS, CreateMutexW, CreateProcessW, CreateProcessWithTokenW,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    KillTimer, MSG, MSGFLT_ALLOW, PBT_APMRESUMEAUTOMATIC, PostQuitMessage, RegisterClassExW,
-    SetTimer, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_HOTKEY,
-    WM_INPUT, WM_LBUTTONUP, WM_POWERBROADCAST, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW,
+    GetMessageW, IsWindow, KillTimer, MSG, MSGFLT_ALLOW, PBT_APMRESUMEAUTOMATIC, PM_REMOVE,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage,
+    WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_HOTKEY, WM_INPUT, WM_LBUTTONUP,
+    WM_POWERBROADCAST, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -40,9 +43,22 @@ pub const CORE_CLASS: PCWSTR = w!("SwaraCore");
 
 const TIMER_DEVICES: usize = 1;
 const DEVICES_MS: u32 = 300;
+/// Armed only while a guard pause or snooze runs.
+const TIMER_WAKE: usize = 2;
+/// Armed only while the tray icon could not be added.
+const TIMER_TRAY: usize = 3;
+const TRAY_RETRY_MS: u32 = 3_000;
+/// About a minute of retries covers a slow shell at logon.
+const TRAY_TRIES: u32 = 20;
+/// The audio service can still be starting at logon.
+const AUDIO_TRIES: u32 = 5;
+const AUDIO_RETRY: Duration = Duration::from_secs(2);
 const APP_NAME: &str = "Swara";
 /// Queue-only tag for a raw key that arrived while the state was busy; never posted.
 const RAW_KEY: u32 = WM_APP + 0x100;
+/// A tray menu left open while typing must not grow the queue without end.
+const BACKLOG_CAP: usize = 1024;
+const MISSED_CAP: usize = 4;
 
 struct Core {
     hwnd: HWND,
@@ -65,6 +81,11 @@ struct Core {
     pending: Option<(Side, Drift, Vec<PromptRow>)>,
     /// Drift behind the visible prompt, so "Switch back" reverts exactly what changed.
     shown: Option<(Side, Drift)>,
+    tray_tries: u32,
+    /// Balloons that came before the tray icon existed; shown once the icon is added.
+    missed_notices: VecDeque<String>,
+    raw_sink_ok: bool,
+    taken_warned: Vec<String>,
 }
 
 /// Returns the config, whether saving is blocked, and a notice for the user.
@@ -94,9 +115,11 @@ fn load_config(path: Option<&PathBuf>) -> (Config, bool, Option<Key>) {
     }
 }
 
-/// First run follows the installer's autostart checkbox (the Run value); later runs follow config.
+/// First run follows the installer's autostart checkbox (the Run value). Later starts follow
+/// config, except that a Run value config calls off was added since by that same checkbox: the
+/// core removes it whenever config says off.
 fn initial_autostart(fresh: bool, cfg: bool, run_exists: bool) -> bool {
-    if fresh { run_exists } else { cfg }
+    if fresh { run_exists } else { cfg || run_exists }
 }
 
 fn sync_autostart(enabled: bool) {
@@ -122,11 +145,35 @@ impl Core {
         }
     }
 
-    fn balloon(&self, key: Key) {
-        self.tray.notice(APP_NAME, t(self.lang, key));
+    /// False when the tray icon is missing; the text then waits for the icon.
+    fn balloon(&mut self, text: &str) -> bool {
+        let shown = self.tray.notice(APP_NAME, text);
+        // The earliest notices are kept when full: a config notice outranks later ones.
+        let missed = &mut self.missed_notices;
+        if !shown && missed.len() < MISSED_CAP && !missed.iter().any(|m| m == text) {
+            missed.push_back(text.to_owned());
+        }
+        shown
     }
 
-    fn register_keys(&mut self) {
+    fn show_tray(&mut self) {
+        if self.tray.show() {
+            self.tray_tries = 0;
+            self.disarm(TIMER_TRAY);
+            for text in std::mem::take(&mut self.missed_notices) {
+                self.balloon(&text);
+            }
+        } else if self.tray_tries < TRAY_TRIES {
+            self.tray_tries += 1;
+            self.arm(TIMER_TRAY, TRAY_RETRY_MS);
+        } else {
+            log::error("tray: giving up until the taskbar restarts");
+        }
+    }
+
+    /// Returns the labels of keys another app already owns.
+    fn register_keys(&mut self) -> Vec<String> {
+        let mut taken = Vec::new();
         for k in hotkey::unique_keys(&self.cfg.bindings) {
             if let Err(e) = hotkey::check(&k) {
                 log::line(&format!("hotkey: skip {} ({e:?})", hotkey::label(&k)));
@@ -140,10 +187,55 @@ impl Core {
                 Ok(()) => self.keys.push(k),
                 Err(e) => {
                     log::line(&format!("hotkey: {} failed: {e}", hotkey::label(&k)));
+                    taken.push(hotkey::label(&k));
                     self.raw_only.push(k);
                 }
             }
         }
+        taken
+    }
+
+    /// So a key that silently stopped working is not a mystery. Every settings save reloads, so
+    /// the same set of keys is reported only once.
+    fn warn_keys(&mut self, taken: Vec<String>) {
+        if !self.raw_sink_ok || taken == self.taken_warned {
+            // Without the sink the start-up notice already covers taken keys.
+            return;
+        }
+        if !taken.is_empty() {
+            let text = fmt(
+                t(self.lang, Key::HotkeyTaken),
+                &[("keys", &taken.join(", "))],
+            );
+            self.balloon(&text);
+        }
+        self.taken_warned = taken;
+    }
+
+    fn arm(&self, id: usize, ms: u32) {
+        // SAFETY: own window; re-arming the same id restarts it. Every core timer is one-shot:
+        // core_proc kills it before handling the tick.
+        if unsafe { SetTimer(Some(self.hwnd), id, ms, None) } == 0 {
+            let why = windows::core::Error::from_thread();
+            log::error(&format!("timer {id} not set: {why}"));
+        }
+    }
+
+    /// Re-checks the guard when a pause or snooze ends; no pause means no timer.
+    fn arm_wake(&self) {
+        match self.guard.next_wake(Instant::now()) {
+            // +1 ms because the guard treats the exact end as still paused.
+            Some(left) => self.arm(
+                TIMER_WAKE,
+                u32::try_from(left.as_millis() + 1).unwrap_or(u32::MAX),
+            ),
+            None => self.disarm(TIMER_WAKE),
+        }
+    }
+
+    fn disarm(&self, id: usize) {
+        // SAFETY: own window; an id that is not set just makes this fail.
+        let _ = unsafe { KillTimer(Some(self.hwnd), id) };
     }
 
     fn unregister_keys(&mut self) {
@@ -162,7 +254,7 @@ impl Core {
         self.last_fire = Some(now);
         self.wake_stats();
         let list = self.audio.list(Flow::Render);
-        let cur = self.audio.current().render[0].clone();
+        let cur = self.audio.default_output();
         let targets = devices::targets_for(key, &self.cfg.bindings);
         match devices::next_target(&targets, &list, cur.as_deref()) {
             Some(d) => self.switch_to(d, Some(key)),
@@ -181,7 +273,11 @@ impl Core {
     }
 
     fn on_raw(&mut self, vk: u32, down: bool) {
-        if !self.held.press(vk, down) {
+        // Nearly every key is not a hotkey; those skip the modifier queries below.
+        if !self.keys.iter().chain(&self.raw_only).any(|k| k.vk == vk) {
+            return;
+        }
+        if !self.held.press(vk, down, Instant::now()) {
             return;
         }
         let mods = hotkey::mods_down();
@@ -199,10 +295,19 @@ impl Core {
         } else {
             Roles::ConsoleMultimedia
         };
-        if let Err(e) = audio::set_default(&d.id, roles) {
-            log::error(&format!("switch: set_default failed: {e}"));
-            return;
-        }
+        let name = devices::display_name(&d.name, &d.id, &self.cfg.nicknames);
+        let partial = match audio::set_default(&d.id, roles) {
+            Ok(()) => false,
+            Err(e) => {
+                log::error(&format!("switch: set_default failed: {e}"));
+                if !guard::switch_landed(&d.id, &self.audio.current().render) {
+                    let text = format!("{}\t{name}", t(self.lang, Key::OsdSwitchFailed));
+                    popup::show_osd(self.hwnd, &text);
+                    return;
+                }
+                true
+            }
+        };
         guard::after_switch(
             &mut self.cfg,
             &DeviceRef {
@@ -210,16 +315,21 @@ impl Core {
                 name: d.name.clone(),
             },
         );
-        self.save();
         self.guard.reset();
+        self.arm_wake();
+        if partial {
+            // The roles left behind now differ from the new target; the guard finishes or asks.
+            self.schedule_guard_check();
+        }
         if self.cfg.osd {
-            let name = devices::display_name(&d.name, &d.id, &self.cfg.nicknames);
             let text = match key {
                 Some(k) => format!("{name}\t{}", hotkey::label(&k)),
                 None => name,
             };
             popup::show_osd(self.hwnd, &text);
         }
+        // After the OSD: the flush to disk can take a while and the user waits for feedback.
+        self.save();
     }
 
     fn side(&self, side: Side) -> &GuardSide {
@@ -284,6 +394,19 @@ impl Core {
     fn show_prompt(&mut self, side: Side, d: Drift, rows: Vec<PromptRow>) {
         if let Err(e) = popup::show_prompt(self.hwnd, self.lang, side, &rows, self.cfg.snooze_min) {
             log::error(&format!("guard: prompt failed: {e}"));
+            let heading = match side {
+                Side::Out => Key::PopupOutputChanged,
+                Side::In => Key::PopupInputChanged,
+            };
+            // Without the balloon either, the user has not been told; ask again next event.
+            if !self.balloon(t(self.lang, heading)) {
+                self.guard.forget_notified();
+            }
+            // The other side would otherwise wait for a prompt that never comes; each try takes
+            // it off the queue, so this ends.
+            if let Some((side, d, rows)) = self.pending.take() {
+                self.show_prompt(side, d, rows);
+            }
             return;
         }
         self.shown = Some((side, d));
@@ -315,9 +438,16 @@ impl Core {
     }
 
     fn guard_check(&mut self) {
-        let cur = self.audio.current();
-        let outs = self.audio.list(Flow::Render);
-        let ins = self.audio.list(Flow::Capture);
+        // The guard ignores unwatched sides, so their lists are never built.
+        let watched = [Side::Out, Side::In].map(|s| guard::watches(&self.cfg, s));
+        let cur = if watched.contains(&true) {
+            self.audio.current()
+        } else {
+            Current::default()
+        };
+        let list_if = |on: bool, side| if on { self.list(side) } else { Vec::new() };
+        let outs = list_if(watched[0], Side::Out);
+        let ins = list_if(watched[1], Side::In);
         self.drop_stale_prompts(&cur, &outs, &ins);
         match self
             .guard
@@ -346,13 +476,19 @@ impl Core {
                     self.show_prompt(side, d, rows);
                 }
             }
-            Action::GiveUp => {
+            Action::GiveUp { announce } => {
                 log::line("guard: giving up");
                 let n = (guard::BACKOFF.as_secs() / 60).to_string();
                 let body = fmt(t(self.lang, Key::GuardPaused), &[("n", &n)]);
-                self.tray.notice(APP_NAME, &body);
+                // Focus Assist and full-screen games hide balloons but not the OSD; once per
+                // fight is enough over a game.
+                if announce {
+                    popup::show_osd(self.hwnd, &body);
+                }
+                self.balloon(&body);
             }
         }
+        self.arm_wake();
     }
 
     fn on_choice(&mut self, wp: usize, lp: isize) {
@@ -384,6 +520,7 @@ impl Core {
             Choice::Snooze => {
                 let mins = Duration::from_secs(u64::from(self.cfg.snooze_min) * 60);
                 self.guard.snooze(side, Instant::now() + mins);
+                self.arm_wake();
             }
         }
         self.shown = None;
@@ -396,14 +533,14 @@ impl Core {
     fn tray_event(&mut self, lp: LPARAM) {
         let event = (lp.0 as u32) & 0xFFFF;
         if event == WM_LBUTTONUP {
-            open_settings_process();
+            self.open_settings();
         } else if event == WM_CONTEXTMENU {
             self.tray_menu();
         }
     }
 
     fn tray_menu(&mut self) {
-        let active = self.audio.current().render[0].clone();
+        let active = self.audio.default_output();
         let mut outs = self.audio.list(Flow::Render);
         outs.retain(|d| d.present);
         let mut entries = Vec::with_capacity(outs.len());
@@ -429,9 +566,18 @@ impl Core {
                 self.cfg.guard_enabled ^= true;
                 self.save();
                 self.guard.reset();
+                self.arm_wake();
+                // Turning it on catches up with drift; turning it off drops a stale prompt.
+                self.schedule_guard_check();
             }
-            MenuCmd::Settings => open_settings_process(),
+            MenuCmd::Settings => self.open_settings(),
             MenuCmd::Quit => self.shut_down(),
+        }
+    }
+
+    fn open_settings(&mut self) {
+        if !open_settings_process() {
+            self.balloon(t(self.lang, Key::SettingsNotOpened));
         }
     }
 
@@ -441,8 +587,7 @@ impl Core {
     }
 
     fn schedule_guard_check(&self) {
-        // SAFETY: own window; re-arming the same id restarts the one-shot debounce.
-        unsafe { SetTimer(Some(self.hwnd), TIMER_DEVICES, DEVICES_MS, None) };
+        self.arm(TIMER_DEVICES, DEVICES_MS);
     }
 
     fn reload(&mut self) {
@@ -459,11 +604,12 @@ impl Core {
         self.save_blocked = blocked;
         self.lang = i18n::current(self.cfg.lang.clone());
         if let Some(k) = note {
-            self.balloon(k);
+            self.balloon(t(self.lang, k));
         }
         sync_autostart(self.cfg.autostart);
         self.unregister_keys();
-        self.register_keys();
+        let taken = self.register_keys();
+        self.warn_keys(taken);
         // A new guard target may already differ from Windows; check now instead of waiting for
         // the next device event. Other saves keep snoozes and the notified state.
         let after = (
@@ -473,6 +619,7 @@ impl Core {
         );
         if before != after {
             self.guard.reset();
+            self.arm_wake();
             let cur = self.audio.current();
             for (side, old) in [(Side::Out, &before.1), (Side::In, &before.2)] {
                 let list = self.list(side);
@@ -504,18 +651,30 @@ impl Core {
                     self.on_key(key);
                 }
             }
-            WM_APP_DEVICES => {
-                self.schedule_guard_check();
-                self.wake_stats();
-            }
+            WM_APP_DEVICES => self.schedule_guard_check(),
             WM_POWERBROADCAST if wp.0 == PBT_APMRESUMEAUTOMATIC as usize => self.wake_stats(),
-            WM_TIMER if wp.0 == TIMER_DEVICES => self.guard_check(),
+            WM_TIMER if wp.0 == TIMER_DEVICES => {
+                // Once per settled device storm instead of once per event.
+                self.wake_stats();
+                self.guard_check();
+            }
+            WM_TIMER if wp.0 == TIMER_WAKE => self.guard_check(),
+            WM_TIMER if wp.0 == TIMER_TRAY => self.show_tray(),
             RAW_KEY => self.on_raw(wp.0 as u32, lp.0 != 0),
             WM_APP_PROMPT_CHOICE => self.on_choice(wp.0, lp.0),
             WM_APP_TRAY => self.tray_event(lp),
             WM_APP_RELOAD => self.reload(),
             WM_CLOSE => self.shut_down(),
-            other if other == taskbar_created() => self.tray.show(),
+            other if other == taskbar_created() => {
+                // A (re)started taskbar earns a fresh round of retries.
+                self.tray_tries = 0;
+                self.show_tray();
+                // An elevated core that started before the shell could not read the config as
+                // the user; the shell is up now.
+                if self.save_blocked {
+                    self.reload();
+                }
+            }
             _ => {}
         }
     }
@@ -526,12 +685,15 @@ fn taskbar_created() -> u32 {
     *ID.get_or_init(tray::taskbar_created_msg)
 }
 
-fn open_settings_process() {
+/// An elevated core starts settings with the shell's unelevated token, and never with its own:
+/// false means that failed and settings did not open.
+fn open_settings_process() -> bool {
+    let from_shell = admin::elevated_split();
     let program = match std::env::current_exe() {
         Ok(path) => path,
         Err(e) => {
             log::error(&format!("settings: exe path unknown: {e}"));
-            return;
+            return !from_shell;
         }
     };
     let mut cmd: Vec<u16> = format!("\"{}\" --settings", program.display())
@@ -543,21 +705,43 @@ fn open_settings_process() {
         ..Default::default()
     };
     let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: `cmd` is a NUL-terminated mutable buffer, `si`/`pi` outlive the call, and no
-    // handles are inherited so the child cannot keep our mutex alive.
-    let r = unsafe {
-        CreateProcessW(
-            None,
-            Some(PWSTR(cmd.as_mut_ptr())),
-            None,
-            None,
-            false,
-            PROCESS_CREATION_FLAGS(0),
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
+    let r = if from_shell {
+        admin::unelevated_shell_token().and_then(|token| {
+            // SAFETY: `token` is an open primary token, `cmd` a NUL-terminated mutable buffer,
+            // and `si`/`pi` outlive the call. Nothing is inherited.
+            unsafe {
+                CreateProcessWithTokenW(
+                    token.0,
+                    CREATE_PROCESS_LOGON_FLAGS(0),
+                    PCWSTR::null(),
+                    Some(PWSTR(cmd.as_mut_ptr())),
+                    PROCESS_CREATION_FLAGS(0),
+                    None,
+                    PCWSTR::null(),
+                    &si,
+                    &mut pi,
+                )
+            }
+            .map_err(|e| e.to_string())
+        })
+    } else {
+        // SAFETY: `cmd` is a NUL-terminated mutable buffer, `si`/`pi` outlive the call, and no
+        // handles are inherited so the child cannot keep our mutex alive.
+        unsafe {
+            CreateProcessW(
+                None,
+                Some(PWSTR(cmd.as_mut_ptr())),
+                None,
+                None,
+                false,
+                PROCESS_CREATION_FLAGS(0),
+                None,
+                None,
+                &si,
+                &mut pi,
+            )
+        }
+        .map_err(|e| e.to_string())
     };
     match r {
         // SAFETY: both handles were just returned to us and are closed once.
@@ -565,8 +749,12 @@ fn open_settings_process() {
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
         },
-        Err(e) => log::error(&format!("settings: spawn failed: {e}")),
+        Err(e) => {
+            log::error(&format!("settings: spawn failed: {e}"));
+            return !from_shell;
+        }
     }
+    true
 }
 
 /// A message that arrived while the core was borrowed, kept to replay afterwards.
@@ -576,6 +764,26 @@ thread_local! {
     static CORE: RefCell<Option<Core>> = const { RefCell::new(None) };
     /// Fills up while the core is borrowed, for example during the tray menu's modal loop.
     static BACKLOG: RefCell<VecDeque<Queued>> = const { RefCell::new(VecDeque::new()) };
+}
+
+/// Drops a key-down when the last queued event of that key is a key-down too: auto-repeat while
+/// the tray menu is open adds nothing. Past the cap further keys are dropped (a lost key-up heals
+/// itself in `RawHeld`); other messages are rare and always kept, WM_CLOSE among them.
+fn queue_later(backlog: &mut VecDeque<Queued>, q: Queued) {
+    let (msg, wp, lp) = q;
+    if msg != RAW_KEY {
+        backlog.push_back(q);
+        return;
+    }
+    let repeat = lp.0 != 0
+        && backlog
+            .iter()
+            .rev()
+            .find(|e| e.0 == RAW_KEY && e.1 == wp)
+            .is_some_and(|e| e.2.0 != 0);
+    if !repeat && backlog.len() < BACKLOG_CAP {
+        backlog.push_back(q);
+    }
 }
 
 fn next_queued() -> Option<Queued> {
@@ -588,7 +796,7 @@ fn with_core(later: Option<Queued>, work: impl FnOnce(&mut Core)) -> bool {
     CORE.with(|slot| match slot.try_borrow_mut() {
         Err(_) => {
             if let Some(q) = later {
-                BACKLOG.with_borrow_mut(|backlog| backlog.push_back(q));
+                BACKLOG.with_borrow_mut(|backlog| queue_later(backlog, q));
             }
             true
         }
@@ -681,12 +889,37 @@ fn make_window() -> windows::core::Result<HWND> {
     }
 }
 
+/// Waits while still answering messages: a broadcast sent to an unresponsive top-level window
+/// would hang its sender. Only used on the failing start path.
+fn wait_pumping(total: Duration) {
+    let end = Instant::now() + total;
+    let mut msg = MSG::default();
+    while Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: drains this thread's queue; with no core yet, core_proc defers to
+        // DefWindowProc.
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
+
 /// Runs the tray core until Quit. Returns the process exit code.
 pub fn run() -> i32 {
     // SAFETY: static name; the handle stays open for the process lifetime on purpose.
     let mutex = unsafe { CreateMutexW(None, false, w!("Local\\Swara-Core")) };
     // SAFETY: reads this thread's last error right after CreateMutexW.
     if mutex.is_err() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // A second launch often means the icon went missing; the running core re-adds it.
+        // SAFETY: static class name; posting to a window that is gone just fails.
+        unsafe {
+            if let Ok(core) = FindWindowW(CORE_CLASS, None) {
+                let _ = PostMessageW(Some(core), taskbar_created(), WPARAM(0), LPARAM(0));
+            }
+        }
         return 0;
     }
     log::init();
@@ -696,7 +929,16 @@ pub fn run() -> i32 {
     stats::init_core();
 
     let path = config::config_file();
-    let (cfg, save_blocked, note) = load_config(path.as_ref());
+    let (mut cfg, save_blocked, note) = load_config(path.as_ref());
+    // Only at start: on a reload after "off" the Run value is simply not removed yet.
+    if !save_blocked
+        && initial_autostart(false, cfg.autostart, autostart::is_enabled()) != cfg.autostart
+    {
+        cfg.autostart = true;
+        if let Some(Err(e)) = path.as_ref().map(|p| config::save(p, &cfg)) {
+            log::error(&format!("config: autostart save failed: {e}"));
+        }
+    }
     sync_autostart(cfg.autostart);
     // Audio posts device events to this window, so the window comes first.
     let hwnd = match make_window() {
@@ -714,11 +956,33 @@ pub fn run() -> i32 {
             log::error(&format!("message filter failed: {e}"));
         }
     }
-    let audio = match Audio::new(hwnd) {
-        Ok(a) => a,
+    let mut tries = 0;
+    let audio = loop {
+        match Audio::new(hwnd) {
+            Ok(a) => break a,
+            Err(e) if tries + 1 < AUDIO_TRIES => {
+                tries += 1;
+                log::line(&format!("audio init failed, retrying: {e}"));
+                wait_pumping(AUDIO_RETRY);
+                // A WM_CLOSE while waiting destroys the window; running on without it would
+                // hold the mutex with no tray, hotkeys or sink.
+                // SAFETY: handle check only.
+                if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                    log::line("closed while waiting for audio");
+                    return 1;
+                }
+            }
+            Err(e) => {
+                log::error(&format!("audio init failed: {e}"));
+                return 1;
+            }
+        }
+    };
+    let raw_sink_ok = match hotkey::register_raw_sink(hwnd) {
+        Ok(()) => true,
         Err(e) => {
-            log::error(&format!("audio init failed: {e}"));
-            return 1;
+            log::error(&format!("raw input sink failed: {e}"));
+            false
         }
     };
     let mut core = Core {
@@ -736,18 +1000,29 @@ pub fn run() -> i32 {
         last_fire: None,
         pending: None,
         shown: None,
+        tray_tries: 0,
+        missed_notices: VecDeque::new(),
+        raw_sink_ok,
+        taken_warned: Vec::new(),
     };
-    core.register_keys();
-    if let Some(e) = hotkey::register_raw_sink(hwnd).err() {
-        log::error(&format!("raw input sink failed: {e}"));
-    }
+    core.show_tray();
+    let taken = core.register_keys();
     if let Some(k) = note {
-        core.balloon(k);
+        core.balloon(t(core.lang, k));
+    }
+    if raw_sink_ok {
+        core.warn_keys(taken);
+    } else {
+        core.balloon(t(core.lang, Key::KeyboardUnreadable));
     }
     // Windows may have drifted while Swara was not running.
     core.schedule_guard_check();
     core.wake_stats();
-    update::remove_stale_installers();
+    // A big %TEMP% must not hold up the first hotkey.
+    let sweep = std::thread::Builder::new().spawn(update::remove_stale_installers);
+    if let Err(e) = sweep {
+        log::error(&format!("installer sweep not started: {e}"));
+    }
     CORE.set(Some(core));
 
     let mut msg = MSG::default();
@@ -771,13 +1046,39 @@ pub fn run() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::initial_autostart;
+    use super::*;
+
+    fn key(vk: usize, down: bool) -> Queued {
+        (RAW_KEY, WPARAM(vk), LPARAM(isize::from(down)))
+    }
+
+    #[test]
+    fn backlog_skips_repeats_and_stays_bounded() {
+        let mut q = VecDeque::new();
+        queue_later(&mut q, key(0x6B, true));
+        queue_later(&mut q, key(0x6B, true));
+        queue_later(&mut q, key(0x4B, true));
+        queue_later(&mut q, key(0x6B, true));
+        assert_eq!(q.len(), 2);
+        queue_later(&mut q, key(0x6B, false));
+        queue_later(&mut q, key(0x6B, true));
+        assert_eq!(q.len(), 4);
+        for n in 0..(2 * BACKLOG_CAP) {
+            queue_later(&mut q, key(n % 2, true));
+            queue_later(&mut q, key(n % 2, false));
+        }
+        assert_eq!(q.len(), BACKLOG_CAP);
+        // Messages other than keys are never dropped.
+        queue_later(&mut q, (WM_CLOSE, WPARAM(0), LPARAM(0)));
+        assert_eq!(q.back().map(|e| e.0), Some(WM_CLOSE));
+    }
 
     #[test]
     fn first_run_follows_installer_choice() {
         assert!(initial_autostart(true, false, true));
         assert!(!initial_autostart(true, true, false));
-        assert!(!initial_autostart(false, false, true));
+        assert!(initial_autostart(false, false, true));
+        assert!(!initial_autostart(false, false, false));
         assert!(initial_autostart(false, true, false));
     }
 }

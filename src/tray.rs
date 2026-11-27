@@ -58,14 +58,13 @@ pub struct Tray {
 }
 
 impl Tray {
+    /// The icon appears on `show`, which can fail and needs a retry.
     pub fn create(owner: HWND) -> Self {
-        let mut tray = Self {
+        Self {
             owner,
             icon: load_icon(),
             hover_text: DEFAULT_TIP.to_owned(),
-        };
-        tray.show();
-        tray
+        }
     }
 
     fn identity(&self) -> NOTIFYICONDATAW {
@@ -100,25 +99,32 @@ impl Tray {
         }
     }
 
-    pub fn show(&mut self) {
+    /// False while the shell has no tray yet (early logon); the caller retries.
+    pub fn show(&mut self) -> bool {
         let mut data = self.icon_data();
-        if !Self::send(NIM_ADD, &data) {
+        // ADD also fails when the icon is already there; MODIFY tells the two cases apart.
+        if !Self::send(NIM_ADD, &data) && !Self::send(NIM_MODIFY, &data) {
             crate::log::error("tray icon not added");
+            return false;
         }
         // With version 4 the mouse message arrives in the low word of lParam.
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         Self::send(NIM_SETVERSION, &data);
+        true
     }
 
-    pub fn notice(&self, title: &str, body: &str) {
+    /// False when the balloon could not be handed to the shell, e.g. no icon yet.
+    pub fn notice(&self, title: &str, body: &str) -> bool {
         let mut data = self.identity();
         data.uFlags = NIF_SHOWTIP | NIF_INFO;
         data.dwInfoFlags = NIIF_RESPECT_QUIET_TIME | NIIF_INFO;
         fill_wide(&mut data.szInfoTitle, title);
         fill_wide(&mut data.szInfo, body);
-        if !Self::send(NIM_MODIFY, &data) {
+        let sent = Self::send(NIM_MODIFY, &data);
+        if !sent {
             crate::log::line("tray notice not shown");
         }
+        sent
     }
 
     /// Pops the menu up at the mouse pointer and returns once it is dismissed.

@@ -413,10 +413,18 @@ impl State {
             self.cfg = merged;
             self.render_guard(w);
         }
-        // SAFETY: static class name; PostMessageW only queues and a missing core is fine.
-        unsafe {
-            if let Ok(h) = FindWindowW(app::CORE_CLASS, PCWSTR::null()) {
-                let _ = PostMessageW(Some(h), app::WM_APP_RELOAD, WPARAM(0), LPARAM(0));
+        // SAFETY: static class name; PostMessageW only queues.
+        match unsafe { FindWindowW(app::CORE_CLASS, PCWSTR::null()) } {
+            Ok(h) => {
+                // SAFETY: as above.
+                let _ = unsafe { PostMessageW(Some(h), app::WM_APP_RELOAD, WPARAM(0), LPARAM(0)) };
+            }
+            // No core to apply it: an "off" left only in config would be undone at its next
+            // start, which reads a leftover Run value as the installer's choice.
+            Err(_) => {
+                if let Err(e) = crate::autostart::set_enabled(self.cfg.autostart) {
+                    log::error(&format!("settings: autostart: {e}"));
+                }
             }
         }
         true

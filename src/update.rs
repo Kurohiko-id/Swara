@@ -383,19 +383,23 @@ fn is_installer_name(name: &str) -> bool {
 /// under Program Files (where an elevated update puts them). The running setup still holds its
 /// file during the update, so this runs at the next start instead.
 pub fn remove_stale_installers() {
+    // %TEMP% is the user's: an elevated core deletes there only with the user's rights.
+    let temp = std::env::temp_dir();
+    let _ = crate::admin::as_user(|| remove_installers_in(&temp));
     // Only an install folder: next to a portable exe (say, Downloads) such files are the user's.
-    for folder in [Some(std::env::temp_dir()), install_dir_if_protected()]
-        .into_iter()
-        .flatten()
-    {
-        let Ok(entries) = std::fs::read_dir(folder) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            // A symlink planted under such a name is removed itself, never its target.
-            if e.file_name().to_str().is_some_and(is_installer_name) {
-                let _ = std::fs::remove_file(e.path());
-            }
+    if let Some(dir) = install_dir_if_protected() {
+        remove_installers_in(&dir);
+    }
+}
+
+fn remove_installers_in(folder: &Path) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for e in entries.flatten() {
+        // A symlink planted under such a name is removed itself, never its target.
+        if e.file_name().to_str().is_some_and(is_installer_name) {
+            let _ = std::fs::remove_file(e.path());
         }
     }
 }

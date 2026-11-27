@@ -166,6 +166,13 @@ impl Audio {
         }
     }
 
+    /// Console output default alone: a hotkey press needs one lookup, not the six of `current`.
+    pub fn default_output(&self) -> Option<String> {
+        // SAFETY: COM call on the enumerator; no default reports an error, kept as None.
+        let found = unsafe { self.devices.GetDefaultAudioEndpoint(eRender, eConsole) };
+        found.and_then(|endpoint| endpoint_id(&endpoint)).ok()
+    }
+
     pub fn current(&self) -> Current {
         let ids_for = |flow: EDataFlow| -> RoleIds {
             EVERY_ROLE.map(|role| {
@@ -196,8 +203,14 @@ pub fn set_default(id: &str, roles: Roles) -> Result<()> {
     let wide = HSTRING::from(id);
     let device = PCWSTR(wide.as_ptr());
     let policy: IPolicyConfig = create(&POLICY_CONFIG_CLASS)?;
-    roles.targets().iter().try_for_each(|&role| {
+    // Every role is tried: stopping at the first failure would leave the others behind for no
+    // reason. The first error is reported.
+    let mut first_error = None;
+    for &role in roles.targets() {
         // SAFETY: `wide` stays alive until this function returns, so `device` is valid.
-        unsafe { policy.SetDefaultEndpoint(device, role) }.ok()
-    })
+        if let Err(e) = unsafe { policy.SetDefaultEndpoint(device, role) }.ok() {
+            first_error.get_or_insert(e);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }

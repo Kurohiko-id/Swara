@@ -13,13 +13,13 @@
 
 ---
 
-**Ganti audio cukup satu tombol.**
+**Ganti output audio pakai hotkey atau shortcut keyboard.**
 
-Halo, gue Kurohiko. Sehari-hari gue sering banget bolak-balik antara headset dan speaker. Masalahnya, buka menu Sound Windows pas lagi di tengah-tengah game tuh malesin banget.
+Gue Kurohiko. Sehari-hari gue sering banget bolak-balik headset sama speaker. Masalahnya, buka panel Sound Windows pas lagi di tengah game itu ribet banget.
 
-Tambah ngeselin lagi kalau ada app yang diem-diem ngebajak default device pas baru nyala atau pas colokan nyambung ulang. Ujung-ujungnya baru ngeh pas audionya malah bocor ke speaker.
+Belum lagi ada aplikasi yang diem-diem ganti default device pas baru dibuka atau pas dicolok ulang. Ujung-ujungnya baru ngeh pas suaranya malah keluar dari tempat yang salah.
 
-Swara beresin dua hal itu: bikin satu tombol per device, plus ada fitur "Penjaga" yang bakal ngunci pilihan lu biar nggak keganti-ganti sendiri.
+Swara beresin dua hal itu: satu tombol buat tiap device, plus penjaga yang ngunci pilihan lu biar nggak keganti sendiri.
 
 *Swara* artinya suara.
 

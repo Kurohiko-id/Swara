@@ -6,21 +6,24 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE,
-    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenElevationType,
-    TokenElevationTypeLimited, TokenUser,
+    DuplicateTokenEx, EqualSid, GetTokenInformation, LookupAccountSidW, RevertToSelf, SID_NAME_USE,
+    SecurityImpersonation, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE,
+    TOKEN_IMPERSONATE, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_TYPE, TOKEN_USER,
+    TokenElevation, TokenElevationType, TokenElevationTypeDefault, TokenElevationTypeLimited,
+    TokenImpersonation, TokenPrimary, TokenUser,
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_SYNCHRONIZE,
-    WaitForSingleObject,
+    CREATE_NO_WINDOW, GetCurrentProcess, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, SetThreadToken, WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+    FindWindowW, GetShellWindow, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -28,21 +31,62 @@ use crate::config::{self, Config};
 use crate::{app, autostart, log};
 
 const CORE_EXIT_WAIT_MS: u32 = 5000;
+/// Usually a second or two; a slow sign-in can take much longer, and giving up too early starts
+/// an unelevated core while the mode is on.
+const CORE_START_WAIT: Duration = Duration::from_secs(30);
+const CORE_POLL: Duration = Duration::from_millis(100);
+
+/// A handle closed on drop, so every early return releases it.
+pub(crate) struct Owned(pub(crate) HANDLE);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper is the handle's only owner and closes it once.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Fills `out` from `token`; false when the query fails.
+///
+/// # Safety
+/// `out` must be writable for `len` bytes.
+unsafe fn query_token(
+    token: HANDLE,
+    class: TOKEN_INFORMATION_CLASS,
+    out: *mut c_void,
+    len: u32,
+) -> bool {
+    let mut needed = 0u32;
+    // SAFETY: the caller guarantees `out` is writable for `len` bytes.
+    unsafe { GetTokenInformation(token, class, Some(out), len, &mut needed) }.is_ok()
+}
 
 /// Fills `out` from this process's token; false when any step fails.
 fn read_token(class: TOKEN_INFORMATION_CLASS, out: *mut c_void, len: u32) -> bool {
     let mut own_token = HANDLE::default();
-    // SAFETY: opens our own process token for reading; closed below.
+    // SAFETY: opens our own process token for reading; `Owned` closes it.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own_token) }.is_err() {
         return false;
     }
-    let mut needed = 0u32;
-    // SAFETY: the caller guarantees `out` is writable for `len` bytes.
-    let filled =
-        unsafe { GetTokenInformation(own_token, class, Some(out), len, &mut needed) }.is_ok();
-    // SAFETY: `own_token` was opened above and is not used after this.
-    let _ = unsafe { CloseHandle(own_token) };
-    filled
+    let own_token = Owned(own_token);
+    // SAFETY: every caller passes a buffer of `len` writable bytes.
+    unsafe { query_token(own_token.0, class, out, len) }
+}
+
+/// `None` when `token` (opened with TOKEN_QUERY) cannot be read.
+fn token_elevated(token: HANDLE) -> Option<bool> {
+    let mut elevation = TOKEN_ELEVATION::default();
+    let ptr: *mut TOKEN_ELEVATION = &mut elevation;
+    // SAFETY: `ptr` points at a TOKEN_ELEVATION of the size passed.
+    let read = unsafe {
+        query_token(
+            token,
+            TokenElevation,
+            ptr.cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+        )
+    };
+    read.then_some(elevation.TokenIsElevated != 0)
 }
 
 /// A token field of fixed size, such as `TOKEN_ELEVATION`.
@@ -50,6 +94,177 @@ fn token_value<V: Default>(kind: TOKEN_INFORMATION_CLASS) -> Option<V> {
     let mut value = V::default();
     let ptr: *mut V = &mut value;
     read_token(kind, ptr.cast(), size_of::<V>() as u32).then_some(value)
+}
+
+/// TOKEN_USER plus the largest possible SID (68 bytes); u64 keeps the pointer aligned.
+type UserBuf = [u64; 32];
+
+fn sid_of(buf: &UserBuf) -> windows::Win32::Security::PSID {
+    // SAFETY: a TokenUser query wrote a TOKEN_USER at the start of `buf`, SID included.
+    unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+}
+
+/// True only for an elevated split token (UAC on): only then does an unelevated token exist
+/// to drop to. Unknown counts as split, so the shell path is tried.
+pub fn needs_shell_token(elevated: bool, kind: Option<TOKEN_ELEVATION_TYPE>) -> bool {
+    elevated && kind != Some(TokenElevationTypeDefault)
+}
+
+/// `needs_shell_token` for this process, asked once: neither input can change later.
+pub fn elevated_split() -> bool {
+    static SPLIT: OnceLock<bool> = OnceLock::new();
+    *SPLIT.get_or_init(|| {
+        needs_shell_token(
+            running_elevated(),
+            token_value::<TOKEN_ELEVATION_TYPE>(TokenElevationType),
+        )
+    })
+}
+
+/// How a file operation in a folder the user owns runs.
+#[derive(Debug, PartialEq)]
+enum UserAccess {
+    Direct,
+    Impersonate,
+    Skip,
+}
+
+/// `need`: elevated split and not already impersonating on this thread.
+fn user_access(need: bool, token_ready: bool) -> UserAccess {
+    match (need, token_ready) {
+        (false, _) => UserAccess::Direct,
+        (true, true) => UserAccess::Impersonate,
+        (true, false) => UserAccess::Skip,
+    }
+}
+
+thread_local! {
+    /// Set while this thread impersonates, so a nested call does not revert the outer one.
+    static AS_USER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ends the impersonation even when `f` unwinds.
+struct Revert;
+
+impl Drop for Revert {
+    fn drop(&mut self) {
+        AS_USER.set(false);
+        // SAFETY: no arguments; drops this thread's impersonation token.
+        if unsafe { RevertToSelf() }.is_err() {
+            // Going on would run admin code under the wrong identity, or user code as admin.
+            std::process::abort();
+        }
+    }
+}
+
+/// The shell's impersonation token, kept for the process lifetime once found. The duplicate is
+/// its own kernel object: user and elevation, checked once, cannot change afterwards, and the
+/// shell exiting or restarting does not affect it. Failures are not kept, so a later call
+/// retries (the shell may not be up yet at sign-in).
+fn user_token() -> Option<HANDLE> {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    if CACHED.get().is_none() {
+        let fresh = shell_token_as(TokenImpersonation, TOKEN_QUERY | TOKEN_IMPERSONATE).ok()?;
+        // Another thread may have won the race; this copy then closes on drop.
+        if CACHED.set(fresh.0.0 as usize).is_ok() {
+            std::mem::forget(fresh);
+        }
+    }
+    CACHED.get().map(|&raw| HANDLE(raw as *mut c_void))
+}
+
+/// Runs `f`, a file operation in a folder the user can write (`%APPDATA%`, `%TEMP%`), with the
+/// user's own rights. An elevated core must not: a planted link there would turn its writes and
+/// renames into admin writes anywhere. Elevated with a split token, `f` runs while this thread
+/// impersonates the shell's unelevated token, and `None` (with `f` not run) when that token is
+/// unavailable. Otherwise `f` simply runs. Keep `f` to file work only, and keep it short: while
+/// impersonating, drive letters resolve through the user's device map, so a DLL loaded inside
+/// `f` could come from a folder the user picked.
+pub fn as_user<T>(f: impl FnOnce() -> T) -> Option<T> {
+    let need = elevated_split() && !AS_USER.get();
+    let token = if need { user_token() } else { None };
+    match (user_access(need, token.is_some()), token) {
+        (UserAccess::Direct, _) => Some(f()),
+        (UserAccess::Impersonate, Some(token)) => impersonating(token, f),
+        _ => None,
+    }
+}
+
+/// Runs `f` on this thread under `token`, an impersonation token with TOKEN_IMPERSONATE.
+fn impersonating<T>(token: HANDLE, f: impl FnOnce() -> T) -> Option<T> {
+    // SAFETY: `token` is an open impersonation token; None means the calling thread.
+    unsafe { SetThreadToken(None, Some(token)) }.ok()?;
+    AS_USER.set(true);
+    let _back = Revert;
+    Some(f())
+}
+
+/// The shell's primary token for `CreateProcessWithTokenW`. The Secondary Logon service also
+/// sets the session and default DACL on it; without those two rights it refuses with access
+/// denied.
+pub(crate) fn unelevated_shell_token() -> Result<Owned, String> {
+    shell_token_as(
+        TokenPrimary,
+        TOKEN_QUERY
+            | TOKEN_DUPLICATE
+            | TOKEN_ASSIGN_PRIMARY
+            | TOKEN_ADJUST_DEFAULT
+            | TOKEN_ADJUST_SESSIONID,
+    )
+}
+
+/// A duplicate of the shell's token, refused unless it belongs to this process's user and is
+/// not elevated. The checks run on the duplicate, the token that is actually used.
+fn shell_token_as(kind: TOKEN_TYPE, access: TOKEN_ACCESS_MASK) -> Result<Owned, String> {
+    // SAFETY: no arguments; a missing shell gives a null handle.
+    let shell = unsafe { GetShellWindow() };
+    if shell.is_invalid() {
+        return Err("no shell window".into());
+    }
+    let mut pid = 0u32;
+    // SAFETY: `pid` is a valid out pointer; a window that is gone leaves it 0.
+    unsafe { GetWindowThreadProcessId(shell, Some(&mut pid)) };
+    if pid == 0 {
+        return Err("shell process unknown".into());
+    }
+    // SAFETY: query-only access by pid; `Owned` closes it.
+    let process = Owned(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+            .map_err(|e| format!("open shell: {e}"))?,
+    );
+    let mut raw = HANDLE::default();
+    // SAFETY: `process` is open; the token handle is closed by `Owned`.
+    unsafe { OpenProcessToken(process.0, TOKEN_DUPLICATE, &mut raw) }
+        .map_err(|e| format!("shell token: {e}"))?;
+    let shell_token = Owned(raw);
+    let mut dup = HANDLE::default();
+    // SAFETY: `shell_token` is open with TOKEN_DUPLICATE; the copy is closed by `Owned`.
+    unsafe {
+        DuplicateTokenEx(
+            shell_token.0,
+            access,
+            None,
+            SecurityImpersonation,
+            kind,
+            &mut dup,
+        )
+    }
+    .map_err(|e| format!("duplicate shell token: {e}"))?;
+    let token = Owned(dup);
+
+    if token_elevated(token.0) != Some(false) {
+        return Err("shell token is elevated or unreadable".into());
+    }
+    let (mut theirs, mut ours) = (UserBuf::default(), UserBuf::default());
+    let size = size_of::<UserBuf>() as u32;
+    // SAFETY: `theirs` is writable for `size` bytes.
+    let read = unsafe { query_token(token.0, TokenUser, theirs.as_mut_ptr().cast(), size) }
+        && read_token(TokenUser, ours.as_mut_ptr().cast(), size);
+    // SAFETY: both buffers hold a TOKEN_USER whose SID points inside the buffer.
+    if !read || unsafe { EqualSid(sid_of(&theirs), sid_of(&ours)) }.is_err() {
+        return Err("shell runs as another user".into());
+    }
+    Ok(token)
 }
 
 /// Asked once per process: elevation cannot change later, and the logger checks it per line.
@@ -174,13 +389,11 @@ pub fn scheduler_xml(exe: &Path, account: &str) -> String {
 
 /// `(user, domain)` read from this process's token rather than the USERNAME env vars.
 fn token_account() -> Result<(String, String), String> {
-    // Room for TOKEN_USER plus the largest possible SID (68 bytes); u64 keeps the pointer aligned.
-    let mut raw = [0u64; 32];
+    let mut raw = UserBuf::default();
     if !read_token(TokenUser, raw.as_mut_ptr().cast(), size_of_val(&raw) as u32) {
         return Err("could not read the token user".into());
     }
-    // SAFETY: the TokenUser query wrote a TOKEN_USER at the start of `raw`, SID included.
-    let sid = unsafe { (*raw.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let sid = sid_of(&raw);
     let mut user_buf = [0u16; 257];
     let mut domain_buf = [0u16; 257];
     let mut user_len = user_buf.len() as u32;
@@ -301,16 +514,48 @@ pub fn install_task() -> Result<(), String> {
 pub fn remove_task() -> Result<(), String> {
     let (user, _) = token_account()?;
     let name = elevated_task_name(&user);
-    // Only exit codes are used because schtasks output is localized; a failed query = no task.
-    match run_schtasks(&["/Query", "/TN", &name]) {
-        Ok(()) => run_schtasks(&["/Delete", "/TN", &name, "/F"]),
-        Err(_) => Ok(()),
+    let deleted = run_schtasks(&["/Delete", "/TN", &name, "/F"]);
+    // schtasks exits 1 both for "no such task" and for real errors, and its text is localized;
+    // the task's own file under System32\Tasks tells the two apart.
+    let still_there = in_system_folder(system_dir, "Tasks")
+        .and_then(|dir| dir.join(&name).try_exists().map_err(|e| e.to_string()));
+    removal_outcome(deleted, still_there)
+}
+
+/// Ok when the task was deleted or provably never existed; any doubt keeps the error.
+fn removal_outcome(
+    deleted: Result<(), String>,
+    still_there: Result<bool, String>,
+) -> Result<(), String> {
+    match (deleted, still_there) {
+        (Ok(()), _) | (Err(_), Ok(false)) => Ok(()),
+        (Err(e), _) => Err(e),
     }
 }
 
+/// Exit code 0 from `/Run` only means the task was queued, so this also waits for the core.
 pub fn start_task() -> Result<(), String> {
     let (user, _) = token_account()?;
-    run_schtasks(&["/Run", "/TN", &elevated_task_name(&user)])
+    run_schtasks(&["/Run", "/TN", &elevated_task_name(&user)])?;
+    if poll(CORE_START_WAIT, CORE_POLL, elevated_core_running) {
+        Ok(())
+    } else {
+        Err("task ran but no core window appeared".into())
+    }
+}
+
+/// Calls `probe` every `step` until it holds or `limit` has passed.
+fn poll(limit: Duration, step: Duration, mut probe: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        if probe() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(step);
+    }
 }
 
 /// Passes `target` to the already-running, unelevated Explorer.
@@ -344,6 +589,33 @@ pub fn config_on_disk() -> Config {
 fn find_core() -> Option<HWND> {
     // SAFETY: static class name; a null title matches any window of that class.
     unsafe { FindWindowW(app::CORE_CLASS, PCWSTR::null()) }.ok()
+}
+
+/// True once a core window exists and its process is elevated. A window from an unelevated
+/// process (a leftover core or a fake) does not count; neither does one that cannot be checked.
+fn elevated_core_running() -> bool {
+    let Some(hwnd) = find_core() else {
+        return false;
+    };
+    let mut pid = 0u32;
+    // SAFETY: `pid` is a valid out pointer; a window that is gone leaves it 0.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: query-only access by pid; `Owned` closes it.
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
+        return false;
+    };
+    let process = Owned(process);
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is open; the token handle is closed by `Owned`.
+    if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    let token = Owned(token);
+    token_elevated(token.0) == Some(true)
 }
 
 /// Sends WM_CLOSE to the running core and waits for its process to end. Ok when none runs.
@@ -479,6 +751,86 @@ mod tests {
         assert!(!inside(r"E:\Program Files\Swara\swara.exe"));
         assert!(!inside(r"C:\Tools\Swara\swara.exe"));
         assert!(!under_program_files(Path::new(EXE), &[]));
+    }
+
+    #[test]
+    fn task_removal_fails_closed() {
+        let failed = || Err::<(), String>("exit 1".into());
+        assert_eq!(removal_outcome(Ok(()), Ok(true)), Ok(()));
+        assert_eq!(removal_outcome(Ok(()), Err("x".into())), Ok(()));
+        assert_eq!(removal_outcome(failed(), Ok(false)), Ok(()));
+        assert!(removal_outcome(failed(), Ok(true)).is_err());
+        assert!(removal_outcome(failed(), Err("access denied".into())).is_err());
+    }
+
+    #[test]
+    fn poll_stops_on_success_or_limit() {
+        let mut calls = 0;
+        let step = Duration::from_millis(1);
+        assert!(poll(Duration::from_secs(5), step, || {
+            calls += 1;
+            calls == 3
+        }));
+        assert_eq!(calls, 3);
+        let start = Instant::now();
+        assert!(!poll(Duration::from_millis(30), step, || false));
+        assert!(start.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn user_files_run_direct_impersonated_or_not_at_all() {
+        assert_eq!(user_access(false, false), UserAccess::Direct);
+        assert_eq!(user_access(false, true), UserAccess::Direct);
+        assert_eq!(user_access(true, true), UserAccess::Impersonate);
+        assert_eq!(user_access(true, false), UserAccess::Skip);
+    }
+
+    #[test]
+    fn as_user_runs_directly_when_unelevated() {
+        if !elevated_split() {
+            assert_eq!(as_user(|| 7), Some(7));
+            // Nested calls run too.
+            assert_eq!(as_user(|| as_user(|| 8)), Some(Some(8)));
+        }
+    }
+
+    #[test]
+    fn impersonation_runs_and_reverts() {
+        // SAFETY: no arguments.
+        if unsafe { GetShellWindow() }.is_invalid() {
+            return;
+        }
+        // Another account's shell, or an elevated one, has no token for us to borrow.
+        let Ok(token) = shell_token_as(TokenImpersonation, TOKEN_QUERY | TOKEN_IMPERSONATE) else {
+            return;
+        };
+        let inside = impersonating(token.0, || {
+            assert!(AS_USER.get());
+            let probe = std::env::temp_dir().join(format!("swara-imp-{}", std::process::id()));
+            std::fs::write(&probe, b"x").is_ok() && std::fs::remove_file(&probe).is_ok()
+        });
+        assert_eq!(inside, Some(true));
+        assert!(!AS_USER.get());
+    }
+
+    #[test]
+    fn shell_token_only_when_elevated_with_split_token() {
+        use windows::Win32::Security::TokenElevationTypeFull;
+        assert!(!needs_shell_token(false, Some(TokenElevationTypeLimited)));
+        assert!(!needs_shell_token(false, None));
+        assert!(needs_shell_token(true, Some(TokenElevationTypeFull)));
+        // UAC off or the built-in Administrator: nothing unelevated exists to drop to.
+        assert!(!needs_shell_token(true, Some(TokenElevationTypeDefault)));
+        assert!(needs_shell_token(true, None));
+    }
+
+    #[test]
+    fn shell_token_matches_this_user_when_unelevated() {
+        // In an unelevated test run the shell's token is ours in all but process.
+        // SAFETY: no arguments.
+        if !running_elevated() && !unsafe { GetShellWindow() }.is_invalid() {
+            assert!(unelevated_shell_token().is_ok());
+        }
     }
 
     #[test]

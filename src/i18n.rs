@@ -195,6 +195,7 @@ keys! {
     // OSD
     OsdSwitched => "Pindah ke {name}", "Switched to {name}";
     OsdNotConnected => "Device tidak terhubung", "Device not connected";
+    OsdSwitchFailed => "Gagal ganti device", "Couldn't switch device";
 
     // Guard popup
     PopupOutputChanged => "Output berubah", "Output changed";
@@ -205,6 +206,16 @@ keys! {
     PopupKeep => "Biarin", "Keep";
     PopupSnooze => "Ingetin {n} mnt", "Remind in {n} min";
     GuardPaused => "Penjaga jeda {n} mnt, ada app lain yang terus ganti device.", "Guard paused for {n} min, another app keeps changing the device.";
+
+    // Hotkey notices (tray balloon)
+    HotkeyTaken => "{keys} sudah dipakai app lain. Swara tetap menangkapnya, tapi app itu juga ikut bereaksi.",
+        "{keys} is already used by another app. Swara still catches it, but that app reacts too.";
+    KeyboardUnreadable => "Swara tidak bisa membaca keyboard, jadi sebagian hotkey mungkin tidak jalan.",
+        "Swara can't read the keyboard, so some hotkeys may not work.";
+
+    // Admin mode notice (tray balloon)
+    SettingsNotOpened => "Pengaturan gagal dibuka dari mode admin. Pastikan layanan Secondary Logon tidak dimatikan.",
+        "Settings couldn't open in admin mode. Make sure the Secondary Logon service isn't disabled.";
 
     // Config notices (tray balloon)
     ConfigCorrupt => "Pengaturan rusak, jadi dikembalikan ke bawaan. File lama disimpan sebagai config.json.bad.",

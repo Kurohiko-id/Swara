@@ -456,8 +456,17 @@ fn spawn(core: bool) {
     let Some(path) = config::app_dir().map(|d| d.join(STATE_FILE)) else {
         return;
     };
-    let mut st: Saved = std::fs::read(&path)
+    let read = config::read_capped(&path);
+    // Only a missing file earns a new ID; any other read error would split one install in two.
+    if read
+        .as_ref()
+        .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+    {
+        return;
+    }
+    let mut st: Saved = read
         .ok()
+        .flatten()
         .and_then(|raw| serde_json::from_slice(&raw).ok())
         .unwrap_or_default();
     if !uid_ok(&st.uid) {

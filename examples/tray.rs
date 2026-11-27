@@ -28,6 +28,7 @@ fn main() {
     .expect("owner window");
 
     let mut tray = Tray::create(owner);
+    tray.show();
     println!("tray added, in tray: {}", in_tray(owner));
     tray.notice("Swara", "tray example");
     println!("balloon shown");

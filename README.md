@@ -13,13 +13,13 @@
 
 ---
 
-**Switch your audio with a single key.**
+**Switch your audio output with a hotkey or keyboard shortcut.**
 
-I'm Kurohiko. I switch between my headset and speakers countless times a day, and alt-tabbing to dig through the Windows sound panel mid-game gets annoying fast.
+I'm Kurohiko. I switch between my headset and speakers all the time, and digging through the Windows sound panel in the middle of a game is just annoying.
 
-To make things worse, some apps quietly hijack your default audio device on startup or reconnect, and you only realize it once the sound blasts from the wrong place.
+On top of that, some apps quietly change the default device when they open or reconnect, and I only notice when the sound comes out of the wrong place.
 
-Swara fixes both: dedicated hotkeys per device, plus a built-in Guard that keeps your audio exactly where you want it.
+Swara fixes both: one key per device, and a guard that keeps your pick.
 
 *Swara* means voice or sound in Indonesian.
 

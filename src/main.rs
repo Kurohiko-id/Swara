@@ -3,6 +3,14 @@
 use swara::{admin, app, log, settings, stats};
 
 fn main() {
+    // The elevated task inherits a PATH its user can edit; a DLL loaded by bare name must come
+    // from System32 only. Swara ships no DLLs of its own.
+    // SAFETY: takes only a flag value.
+    let _ = unsafe {
+        windows::Win32::System::LibraryLoader::SetDefaultDllDirectories(
+            windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
     // Release builds abort on panic, which would otherwise leave no trace of the cause.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

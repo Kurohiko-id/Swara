@@ -3,9 +3,9 @@
 
 use crate::guard::Side;
 use crate::i18n::{Key, ResolvedLang, fmt, t};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
@@ -261,7 +261,31 @@ fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-/// Render target plus text factory, created per paint and released on drop.
+thread_local! {
+    /// Made by the first popup, not at start, then kept: building them again cost every OSD the
+    /// cold Direct2D and font setup. Single-threaded factory, so one per thread.
+    static FACTORIES: RefCell<Option<(ID2D1Factory, IDWriteFactory)>> = const { RefCell::new(None) };
+}
+
+/// A failed attempt is not kept, so the next popup tries again.
+fn factories() -> Result<(ID2D1Factory, IDWriteFactory)> {
+    FACTORIES.with_borrow_mut(|slot| {
+        if let Some(made) = slot {
+            return Ok(made.clone());
+        }
+        // SAFETY: plain factory creation; the interfaces own their references.
+        let made = unsafe {
+            (
+                D2D1CreateFactory::<ID2D1Factory>(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
+                DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)?,
+            )
+        };
+        *slot = Some(made.clone());
+        Ok(made)
+    })
+}
+
+/// Render target plus text factory for one popup, released on drop; the factories stay cached.
 struct Painter {
     target: ID2D1DCRenderTarget,
     words: IDWriteFactory,
@@ -280,13 +304,11 @@ impl Painter {
             dpiY: 96.0,
             ..Default::default()
         };
-        // SAFETY: factory creation with a fully built properties struct.
+        let (factory, words) = factories()?;
+        // SAFETY: target creation with a fully built properties struct.
         unsafe {
-            let factory =
-                D2D1CreateFactory::<ID2D1Factory>(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let target = factory.CreateDCRenderTarget(&target_props)?;
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let words = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)?;
             Ok(Self { target, words })
         }
     }
@@ -391,8 +413,9 @@ impl Painter {
         dims: (i32, i32),
         draw: impl FnOnce(&Self) -> Result<()>,
     ) -> Result<HWND> {
-        static CLASS_READY: Once = Once::new();
-        CLASS_READY.call_once(|| {
+        // Not a Once: a failed registration is tried again by the next popup.
+        static CLASS_READY: AtomicBool = AtomicBool::new(false);
+        if !CLASS_READY.load(Ordering::Relaxed) {
             let class = WNDCLASSEXW {
                 cbSize: CLASS_BYTES,
                 lpfnWndProc: Some(popup_proc),
@@ -401,11 +424,13 @@ impl Painter {
                 ..Default::default()
             };
             // SAFETY: `class` is complete and `popup_proc` is a static function.
-            if unsafe { RegisterClassExW(&class) } == 0 {
+            if unsafe { RegisterClassExW(&class) } != 0 {
+                CLASS_READY.store(true, Ordering::Relaxed);
+            } else {
                 let why = windows::core::Error::from_thread();
                 crate::log::error(&format!("popup class not registered: {why}"));
             }
-        });
+        }
         // SAFETY: our registered class, top-level; destroyed below if painting fails.
         let hwnd = unsafe {
             CreateWindowExW(

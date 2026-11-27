@@ -3,7 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const MOD_NOREPEAT: u32 = 0x4000;
@@ -196,15 +196,52 @@ fn with_suffix(file: &Path, suffix: &str) -> PathBuf {
     file.with_file_name(name)
 }
 
+/// Far above any real config or stats file. Another process can write these, and the core
+/// reads them again on every reload request.
+pub(crate) const READ_CAP: u64 = 1 << 20;
+
+/// Stands in for an IO result when `admin::as_user` could not run the operation.
+fn no_user_rights() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "user token unavailable")
+}
+
+/// `None` when the file is bigger than `READ_CAP`; only that much is ever read.
+pub(crate) fn read_capped(file: &Path) -> io::Result<Option<Vec<u8>>> {
+    crate::admin::as_user(|| read_capped_direct(file)).unwrap_or_else(|| Err(no_user_rights()))
+}
+
+fn read_capped_direct(file: &Path) -> io::Result<Option<Vec<u8>>> {
+    let mut raw = Vec::new();
+    fs::File::open(file)?
+        .take(READ_CAP + 1)
+        .read_to_end(&mut raw)?;
+    Ok((raw.len() as u64 <= READ_CAP).then_some(raw))
+}
+
+/// The read and a `.bad` rename run with the user's rights (see `admin::as_user`).
 pub fn load(file: &Path) -> LoadOutcome {
-    let raw = match fs::read(file) {
+    load_with(file, |f| crate::admin::as_user(f))
+}
+
+/// `run` gives `None` when it may not touch the file: defaults then, nothing renamed, and
+/// `Unreadable` keeps the file from being overwritten.
+fn load_with(
+    file: &Path,
+    run: impl FnOnce(&dyn Fn() -> LoadOutcome) -> Option<LoadOutcome>,
+) -> LoadOutcome {
+    run(&|| load_direct(file)).unwrap_or(LoadOutcome::Unreadable(Config::default()))
+}
+
+fn load_direct(file: &Path) -> LoadOutcome {
+    let raw = match read_capped_direct(file) {
         Ok(raw) => raw,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return LoadOutcome::Fresh(Config::default());
         }
         Err(_) => return LoadOutcome::Unreadable(Config::default()),
     };
-    if let Some(cfg) = decode(&raw) {
+    // An oversized file counts as unparsable: it is kept as `.bad`, like broken JSON.
+    if let Some(cfg) = raw.as_deref().and_then(decode) {
         return LoadOutcome::Loaded(cfg);
     }
     // On Windows this rename also replaces an earlier `.bad`.
@@ -214,10 +251,10 @@ pub fn load(file: &Path) -> LoadOutcome {
 
 /// `load` for every process except the core: any error gives defaults and nothing is renamed.
 pub fn peek(file: &Path) -> Config {
-    let Ok(raw) = fs::read(file) else {
-        return Config::default();
-    };
-    decode(&raw).unwrap_or_default()
+    match read_capped(file) {
+        Ok(Some(raw)) => decode(&raw).unwrap_or_default(),
+        _ => Config::default(),
+    }
 }
 
 /// `None` only when the text is not a JSON object; a bad value falls back for its key alone.
@@ -247,7 +284,13 @@ pub fn save(file: &Path, cfg: &Config) -> io::Result<()> {
 }
 
 /// Writes a temp file and renames it over the target, so a reader never sees half a file.
+/// Runs with the user's rights (see `admin::as_user`); skipped with an error if it cannot.
 pub(crate) fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::admin::as_user(|| write_atomic_direct(file, bytes))
+        .unwrap_or_else(|| Err(no_user_rights()))
+}
+
+fn write_atomic_direct(file: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(folder) = file.parent() {
         fs::create_dir_all(folder)?;
     }
@@ -390,6 +433,44 @@ mod tests {
         assert_eq!(load(&file), LoadOutcome::Corrupt(Config::default()));
         assert!(!file.exists());
         assert_eq!(fs::read_to_string(dir.join(BAD)).unwrap(), "not json");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_file_moves_to_bad_unread() {
+        let dir = fresh_dir("oversized");
+        let file = dir.join(NAME);
+        // Valid JSON padded past the cap: refused on size, not content.
+        let mut big = b"{\"snooze_min\": 45}".to_vec();
+        big.resize(READ_CAP as usize + 1, b' ');
+        fs::write(&file, &big).unwrap();
+        assert_eq!(peek(&file), Config::default());
+        assert!(file.exists(), "peek must not rename");
+        assert_eq!(load(&file), LoadOutcome::Corrupt(Config::default()));
+        assert!(!file.exists());
+        assert_eq!(fs::metadata(dir.join(BAD)).unwrap().len(), READ_CAP + 1);
+        // Right at the cap is still read.
+        big.truncate(READ_CAP as usize);
+        fs::write(&file, &big).unwrap();
+        assert!(matches!(load(&file), LoadOutcome::Loaded(c) if c.snooze_min == 45));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_without_user_rights_leaves_file_alone() {
+        let dir = fresh_dir("norights");
+        let file = dir.join(NAME);
+        fs::write(&file, "not json").unwrap();
+        let got = load_with(&file, |_| None);
+        assert_eq!(got, LoadOutcome::Unreadable(Config::default()));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "not json");
+        assert!(!dir.join(BAD).exists());
+        // The same file through a runner that may act is renamed as usual.
+        assert_eq!(
+            load_with(&file, |f| Some(f())),
+            LoadOutcome::Corrupt(Config::default())
+        );
+        assert!(dir.join(BAD).exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

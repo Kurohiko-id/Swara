@@ -35,7 +35,11 @@ pub enum Action {
         out: Option<Drift>,
         inp: Option<Drift>,
     },
-    GiveUp,
+    /// `announce` is false while the same fight goes on, so the warning is not repeated every
+    /// backoff over a game.
+    GiveUp {
+        announce: bool,
+    },
 }
 
 #[derive(Default)]
@@ -45,6 +49,7 @@ pub struct Guard {
     snoozed_out: Option<Instant>,
     snoozed_in: Option<Instant>,
     last_notified: Option<Current>,
+    pause_told: bool,
 }
 
 /// An unresolved or unplugged target is not drift: reverting to it would fail anyway.
@@ -125,6 +130,8 @@ impl Guard {
         if r_out.is_some() || r_inp.is_some() {
             return self.revert(r_out, r_inp, now);
         }
+        // Nothing left to fight over: a later pause is a new episode worth announcing.
+        self.pause_told = false;
         let (n_out, n_inp) = (pick(out, GuardMode::Notify), pick(inp, GuardMode::Notify));
         if n_out.is_none() && n_inp.is_none() {
             self.last_notified = None;
@@ -155,7 +162,9 @@ impl Guard {
         }
         self.reverts.clear();
         self.backoff_until = Some(now + BACKOFF);
-        Action::GiveUp
+        let announce = !self.pause_told;
+        self.pause_told = true;
+        Action::GiveUp { announce }
     }
 
     pub fn snooze(&mut self, side: Side, until: Instant) {
@@ -168,6 +177,29 @@ impl Guard {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// Time until the next pause or snooze runs out; a drift left behind would otherwise wait
+    /// for an unrelated device event.
+    pub fn next_wake(&self, now: Instant) -> Option<Duration> {
+        [self.backoff_until, self.snoozed_out, self.snoozed_in]
+            .into_iter()
+            .flatten()
+            .filter(|&t| t > now)
+            .min()
+            .map(|t| t - now)
+    }
+
+    /// The prompt never reached the user, so the same drift may notify again.
+    pub fn forget_notified(&mut self) {
+        self.last_notified = None;
+    }
+}
+
+/// After a failed switch: if a default role (asked for by every switch) reached the device, the
+/// pick stands and the guard follows it. Comms is ignored: it may have sat there already, which
+/// would pass a total failure off as a switch.
+pub fn switch_landed(id: &str, roles: &RoleIds) -> bool {
+    roles[..2].iter().any(|r| r.as_deref() == Some(id))
 }
 
 /// A target picked in settings is the user's choice: switch to it now instead of asking.
@@ -188,6 +220,16 @@ pub fn on_new_target(
         return None;
     }
     drift(g, roles, list)
+}
+
+/// False when `evaluate` and `prompt_stale` never look at this side's devices, so the caller can
+/// skip listing them: a device storm with the guard off then costs no enumeration.
+pub fn watches(cfg: &Config, side: Side) -> bool {
+    let g = match side {
+        Side::Out => &cfg.guard_out,
+        Side::In => &cfg.guard_in,
+    };
+    cfg.guard_enabled && g.mode != GuardMode::Off && (g.default.is_some() || g.comms.is_some())
 }
 
 /// A shown Notify popup is stale once its side no longer needs it: guard off, mode changed,
@@ -383,7 +425,10 @@ mod tests {
             );
         }
         let cur = console_drift();
-        assert_eq!(run(&mut g, &c, &cur, plus(t0, 50)), Action::GiveUp);
+        assert_eq!(
+            run(&mut g, &c, &cur, plus(t0, 50)),
+            Action::GiveUp { announce: true }
+        );
         assert_eq!(run(&mut g, &c, &cur, plus(t0, 51)), Action::None);
         assert_eq!(run(&mut g, &c, &cur, plus(t0, 349)), Action::None);
         assert!(matches!(
@@ -422,6 +467,78 @@ mod tests {
             run(&mut g, &c, &console_drift(), plus(t0, 60)),
             Action::Revert { .. }
         ));
+    }
+
+    #[test]
+    fn wake_at_the_earliest_pause_end() {
+        let c = conf(GuardMode::AutoRevert);
+        let mut g = Guard::new();
+        let t0 = Instant::now();
+        assert_eq!(g.next_wake(t0), None);
+        for i in 0..5 {
+            run(&mut g, &c, &console_drift(), plus(t0, i));
+        }
+        assert_eq!(
+            run(&mut g, &c, &console_drift(), t0),
+            Action::GiveUp { announce: true }
+        );
+        assert_eq!(g.next_wake(t0), Some(BACKOFF));
+        g.snooze(Side::In, plus(t0, 60));
+        assert_eq!(g.next_wake(plus(t0, 10)), Some(Duration::from_secs(50)));
+        // Expired entries are not wakes; nothing left means no timer.
+        assert_eq!(
+            g.next_wake(plus(t0, 61)),
+            Some(BACKOFF - Duration::from_secs(61))
+        );
+        assert_eq!(g.next_wake(plus(t0, 300)), None);
+        g.reset();
+        assert_eq!(g.next_wake(t0), None);
+    }
+
+    #[test]
+    fn unseen_prompt_notifies_again() {
+        let c = conf(GuardMode::Notify);
+        let mut g = Guard::new();
+        let now = Instant::now();
+        assert!(matches!(
+            run(&mut g, &c, &console_drift(), now),
+            Action::Notify { .. }
+        ));
+        g.forget_notified();
+        assert!(matches!(
+            run(&mut g, &c, &console_drift(), now),
+            Action::Notify { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_switch_counts_only_if_a_default_role_moved() {
+        assert!(switch_landed("X", &[id("X"), id("S"), id("S")]));
+        assert!(switch_landed("X", &[id("S"), id("X"), id("S")]));
+        // Comms already sat on X before the switch; console and multimedia both failed.
+        assert!(!switch_landed("X", &[id("S"), id("S"), id("X")]));
+        assert!(!switch_landed("X", &[id("S"), id("S"), None]));
+    }
+
+    #[test]
+    fn pause_is_announced_once_per_episode() {
+        let c = conf(GuardMode::AutoRevert);
+        let mut g = Guard::new();
+        let t0 = Instant::now();
+        let fight = |g: &mut Guard, from: u64| {
+            for i in 0..5 {
+                run(g, &c, &console_drift(), plus(t0, from + i));
+            }
+            run(g, &c, &console_drift(), plus(t0, from + 5))
+        };
+        assert_eq!(fight(&mut g, 0), Action::GiveUp { announce: true });
+        // Still fighting after the backoff: same episode, no new announcement.
+        assert_eq!(fight(&mut g, 400), Action::GiveUp { announce: false });
+        // Windows matches the target again: the episode is over.
+        assert_eq!(run(&mut g, &c, &steady(), plus(t0, 800)), Action::None);
+        assert_eq!(fight(&mut g, 900), Action::GiveUp { announce: true });
+        g.reset();
+        assert_eq!(fight(&mut g, 1300), Action::GiveUp { announce: true });
     }
 
     #[test]
@@ -513,6 +630,36 @@ mod tests {
         keep(&mut side, &[id("H"), id("H"), id("H")], &outs());
         assert_eq!(side.default, Some(dref("H")));
         assert_eq!(side.comms, None);
+    }
+
+    #[test]
+    fn unwatched_side_needs_no_device_list() {
+        let mut c = conf(GuardMode::Notify);
+        assert!(watches(&c, Side::Out));
+        // The input side is Off in `conf`.
+        assert!(!watches(&c, Side::In));
+        c.guard_out.default = None;
+        assert!(!watches(&c, Side::Out));
+        c.guard_out.comms = Some(dref("H"));
+        assert!(watches(&c, Side::Out));
+        c.guard_enabled = false;
+        assert!(!watches(&c, Side::Out));
+        // An empty list gives the same answers wherever a side is not watched.
+        for c in [conf(GuardMode::Off), conf(GuardMode::AutoRevert)] {
+            for cur in [steady(), console_drift()] {
+                let ins_empty = Guard::new().evaluate(&c, &cur, &outs(), &[], Instant::now());
+                assert_eq!(ins_empty, run(&mut Guard::new(), &c, &cur, Instant::now()));
+                for side in [Side::Out, Side::In] {
+                    if !watches(&c, side) {
+                        let full = if side == Side::Out { outs() } else { ins() };
+                        assert_eq!(
+                            prompt_stale(&c, side, &cur, &[]),
+                            prompt_stale(&c, side, &cur, &full)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -150,7 +150,8 @@ end;
   Its path is fixed (userpf\Swara with no folder page), and cmd expands that user's LOCALAPPDATA.
   Because the folder is writable by that user, its uninstaller must not run with admin rights:
   if setup was itself started elevated (update from an elevated core, Run as administrator), the
-  original user is elevated as well, so cmd sees the High Mandatory Level SID and exits 3. }
+  original user is elevated as well. So it runs only when whoami shows the Medium Mandatory Level
+  SID; a High token, or whoami failing to run, leaves findstr's exit 1 and nothing runs. }
 procedure UninstallUserCopy;
 var
   UserUninst: String;
@@ -159,7 +160,7 @@ begin
   UserUninst := '"%LOCALAPPDATA%\Programs\Swara\unins000.exe"';
   if not ExecAsOriginalUser(ExpandConstant('{sys}\cmd.exe'),
     '/s /c "' + ExpandConstant('"{sys}\whoami.exe" /groups | "{sys}\findstr.exe"') +
-    ' S-1-16-12288 >nul && exit /b 3 || if exist ' + UserUninst + ' ' + UserUninst +
+    ' S-1-16-8192 >nul && if exist ' + UserUninst + ' ' + UserUninst +
     ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"',
     '', SW_HIDE, ewWaitUntilTerminated, Rc) then
     Log('per-user copy: uninstaller did not launch, ' + SysErrorMessage(Rc))

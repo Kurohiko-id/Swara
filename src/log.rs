@@ -19,14 +19,15 @@ pub fn init() {
         return;
     };
     let logs = base.join("logs");
-    let _ = fs::create_dir_all(&logs);
+    let _ = crate::admin::as_user(|| fs::create_dir_all(&logs));
     let _ = LOG_DIR.set(logs);
 }
 
-/// Dropped silently until `init()` has chosen a folder.
+/// Dropped silently until `init()` has chosen a folder, and when an elevated process cannot
+/// write with the user's rights. Nothing inside may log, or it would recurse.
 pub fn line(msg: &str) {
     if let Some(logs) = LOG_DIR.get() {
-        write_entry(logs, msg);
+        let _ = crate::admin::as_user(|| write_entry(logs, msg));
     }
 }
 
@@ -63,7 +64,8 @@ fn roll(logs: &Path, limit: u64, archives: usize) {
 }
 
 /// Empties the live file once it hits `limit` bytes. The handle is opened without following a
-/// link and checked to be a plain file, so the cut can only ever land on the log itself.
+/// link and checked to be a plain file, so the cut lands on the log itself. Kept for elevated
+/// processes on top of the user's rights from `admin::as_user`, so they never rename.
 fn cap_in_place(live: &Path, limit: u64) {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -85,8 +87,8 @@ fn cap_in_place(live: &Path, limit: u64) {
 }
 
 fn write_entry(logs: &Path, msg: &str) {
-    // Rolling renames files in a folder the user owns; an elevated process could be tricked
-    // into following a planted link, so it empties the file in place instead.
+    // Runs inside `admin::as_user`, so a planted link only reaches what the user could write
+    // anyway. An elevated process still empties the file in place instead of renaming.
     if crate::admin::running_elevated() {
         cap_in_place(&logs.join(LOG_NAME), ROLL_AT);
     } else {
