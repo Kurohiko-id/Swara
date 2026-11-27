@@ -1,0 +1,73 @@
+<!-- Source for the installer images; render.sh screenshots one element per run (transparent bg).
+     side            164x314  wizard panel on the left
+     small           55x55    logo at the top right of inner pages
+     support|kofi|topup-en|id  440x58  link buttons on the Finish page -->
+<style>
+@font-face { font-family: Geist; font-weight: 400; src: url(../../assets/fonts/Geist-Regular.ttf) }
+@font-face { font-family: Geist; font-weight: 500; src: url(../../assets/fonts/Geist-Medium.ttf) }
+@font-face { font-family: Geist; font-weight: 600; src: url(../../assets/fonts/Geist-SemiBold.ttf) }
+:root { --brand: #0f766e; --base: #fafaf9; --text: #1c1917; --soft: #57534e }
+* { margin: 0; box-sizing: border-box }
+html, body { overflow: hidden; background: transparent; font-family: Geist, "Segoe UI", sans-serif }
+.sprite { position: absolute; width: 0; height: 0 }
+.art { display: none }
+#side {
+  width: 164px; height: 314px; gap: 14px;
+  flex-direction: column; align-items: center; justify-content: center;
+  color: var(--text); border-right: 1px solid #e7e5e4;
+  background: linear-gradient(180deg, #f5f5f4 0%, var(--base) 55%, #e7f3f1 100%);
+}
+#side svg { width: 76px; height: 76px }
+#side .name { font-size: 20px; font-weight: 600; letter-spacing: -.4px }
+#small { width: 55px; height: 55px; justify-content: center; align-items: center }
+#small svg { width: 44px; height: 44px }
+.cta {
+  width: 440px; height: 58px; padding: 0 18px; gap: 14px; border-radius: 10px;
+  align-items: center; color: #fff; font-size: 15px; font-weight: 600;
+}
+.cta svg { flex: none; width: 22px; height: 22px }
+.cta .sub { display: block; font-size: 12.5px; font-weight: 400; opacity: .85 }
+.cta .open { margin-left: auto; font-size: 13.5px; font-weight: 500 }
+.cta.support { background: var(--brand) }
+.cta.kofi { background: #7c4a2d }
+.cta.topup { background: var(--text) }
+</style>
+<svg class="sprite" aria-hidden="true"><defs>
+<symbol id="logo" viewBox="0 0 256 256"><g fill="#0d9488">
+  <path d="M180.83 53.5A61 61 0 1 0 128 145L128 111A27 27 0 1 1 151.38 70.5Z"/>
+  <path d="M128 111A61 61 0 1 1 75.17 202.5L104.62 185.5A27 27 0 1 0 128 145Z"/>
+  <path d="M143.11 62a23 23 0 1 0 46 0a23 23 0 1 0 -46 0Z"/>
+  <path d="M66.89 194a23 23 0 1 0 46 0a23 23 0 1 0 -46 0Z"/>
+</g></symbol>
+<symbol id="i-heart" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round">
+  <path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/>
+</symbol>
+<symbol id="i-mug" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
+  <path d="M4 9h12v6a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V9zM16 10h2a2.5 2.5 0 0 1 0 5h-2M7 3v2M10 3v2M13 3v2"/>
+</symbol>
+<symbol id="i-gamepad" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
+  <path d="M7 7h10a5 5 0 0 1 5 5v1a4 4 0 0 1-7 2.6L14 14h-4l-1 1.6A4 4 0 0 1 2 13v-1a5 5 0 0 1 5-5zM7 10v4M5 12h4M16 11h.01M18 13h.01"/>
+</symbol>
+</defs></svg>
+
+<div class="art" id="side"><svg><use href="#logo"/></svg><span class="name">Swara</span></div>
+<div class="art" id="small"><svg><use href="#logo"/></svg></div>
+
+<div class="art cta support" id="support-en"><svg><use href="#i-heart"/></svg>
+  <div>Support the developer<span class="sub">at kurohiko.id</span></div><span class="open">Open →</span></div>
+<div class="art cta kofi" id="kofi-en"><svg><use href="#i-mug"/></svg>
+  <div>Buy me a coffee<span class="sub">on Ko-fi</span></div><span class="open">Open →</span></div>
+<div class="art cta topup" id="topup-en"><svg><use href="#i-gamepad"/></svg>
+  <div>Top up your games<span class="sub">at KurohikoTopUp.com</span></div><span class="open">Open →</span></div>
+
+<div class="art cta support" id="support-id"><svg><use href="#i-heart"/></svg>
+  <div>Dukung developer<span class="sub">di kurohiko.id</span></div><span class="open">Buka →</span></div>
+<div class="art cta kofi" id="kofi-id"><svg><use href="#i-mug"/></svg>
+  <div>Traktir kopi<span class="sub">di Ko-fi</span></div><span class="open">Buka →</span></div>
+<div class="art cta topup" id="topup-id"><svg><use href="#i-gamepad"/></svg>
+  <div>Top up game kamu<span class="sub">di KurohikoTopUp.com</span></div><span class="open">Buka →</span></div>
+<script>
+document.fonts.ready.then(() => {
+  document.getElementById(location.hash.slice(1)).style.display = 'flex';
+});
+</script>

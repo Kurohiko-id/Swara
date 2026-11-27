@@ -1,0 +1,1228 @@
+import "../assets/fonts/Geist-Regular.ttf";
+import "../assets/fonts/Geist-Medium.ttf";
+import "../assets/fonts/Geist-SemiBold.ttf";
+import "../assets/fonts/GeistMono-Medium.ttf";
+import "../assets/fonts/GeistMono-SemiBold.ttf";
+
+// Design tokens.
+global Tok {
+    out property <color> bg: #fafaf9;
+    out property <color> bg-2: #f2f1ef;
+    out property <color> line: #e7e5e4;
+    out property <color> line-2: #d6d3d1;
+    out property <color> ink: #1c1917;
+    out property <color> ink-2: #57534e;
+    out property <color> ink-3: #6f6a64;
+    out property <color> acc: #0f766e;
+    out property <color> acc-soft: #e3f1ef;
+    out property <color> warn: #9a3412;
+    out property <color> white: #ffffff;
+    out property <string> sans: "Geist";
+    out property <string> mono: "Geist Mono";
+}
+
+// Set by ui::apply_strings at startup and again on every language switch.
+export global Strings {
+    in property <string> keys-tab;
+    in property <string> guard-tab;
+    in property <string> general-tab;
+    in property <string> keys-help;
+    in property <string> add-key;
+    in property <string> set-key;
+    in property <string> press-key;
+    in property <string> drag-hint;
+    in property <string> remove-row;
+    in property <string> remove-key;
+    in property <string> rerecord-key;
+    in property <string> add-another-key;
+    in property <string> on-switch;
+    in property <string> show-name;
+    in property <string> show-name-sub;
+    in property <string> switch-comms;
+    in property <string> switch-comms-sub;
+    in property <string> device-names;
+    in property <string> guard-on;
+    in property <string> guard-on-sub;
+    in property <string> output;
+    in property <string> input;
+    in property <string> main-device;
+    in property <string> comms-device;
+    in property <string> mode;
+    in property <[string]> modes;
+    in property <string> snooze-label;
+    in property <string> snooze-sub;
+    in property <string> minutes;
+    in property <string> decrease;
+    in property <string> increase;
+    in property <string> language-title;
+    in property <[string]> langs;
+    in property <string> system;
+    in property <string> run-at-startup;
+    in property <string> run-as-admin;
+    in property <string> league-bold;
+    in property <string> league-rest;
+    in property <string> update-support;
+    in property <string> version-prefix;
+    in property <string> version-suffix;
+    in property <string> kofi-row;
+    in property <string> kofi;
+    in property <string> saweria-row;
+    in property <string> saweria;
+    in property <string> topup-row;
+    in property <string> topup;
+    in property <string> bug-row;
+    in property <string> bug;
+    in property <string> pick-device;
+}
+
+export struct Opt {
+    label: string,
+    enabled: bool,
+}
+
+export struct KeyChip {
+    label: string,
+    recording: bool,
+}
+
+export struct BindRow {
+    keys: [KeyChip],
+    // Recording a key to add to this row.
+    adding: bool,
+    device: int,
+    cycle: string,
+    note: string,
+}
+
+export struct NameRow {
+    label: string,
+    nick: string,
+}
+
+component H2 inherits Text {
+    font-size: 15px;
+    font-weight: 600;
+    color: Tok.ink;
+    height: 18px;
+    vertical-alignment: center;
+}
+
+component Sub inherits Text {
+    font-size: 12.5px;
+    color: Tok.ink-2;
+    wrap: word-wrap;
+}
+
+component HLine inherits Rectangle {
+    // Physical pixel: 1px logical rounds to 1 or 2 rows at fractional scales.
+    height: 1phx;
+    background: Tok.line;
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked;
+    height: 36px;
+    border-radius: 6px;
+    background: active ? Tok.bg-2 : transparent;
+    Text {
+        x: 10px;
+        text: root.label;
+        font-size: 13.5px;
+        font-weight: root.active ? 600 : 500;
+        color: root.active || ta.has-hover ? Tok.ink : Tok.ink-2;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Toggle inherits Rectangle {
+    in property <bool> on;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    width: 34px;
+    height: 20px;
+    border-radius: 10px;
+    background: on ? Tok.acc : Tok.line-2;
+    opacity: enabled ? 1 : 0.5;
+    accessible-role: switch;
+    accessible-checked: on;
+    Rectangle {
+        x: root.on ? 17px : 3px;
+        y: 3px;
+        width: 14px;
+        height: 14px;
+        border-radius: 7px;
+        background: Tok.white;
+        animate x { duration: 200ms; easing: cubic-bezier(0.16, 1, 0.3, 1); }
+    }
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            root.toggled(!root.on);
+        }
+    }
+}
+
+// Label (+ optional small line) on the left, control on the right, hairlines between rows.
+component SwRow inherits VerticalLayout {
+    in property <string> label;
+    in property <string> sub;
+    in property <bool> first;
+    in property <bool> strong;
+    // Optional monospace run after the label (the version number).
+    in property <string> mono;
+    in property <string> after;
+    if root.first: HLine { }
+    HorizontalLayout {
+        padding-top: 9px;
+        padding-bottom: 9px;
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                alignment: start;
+                spacing: 4px;
+                Text {
+                    text: root.label;
+                    font-size: 13.5px;
+                    font-weight: root.strong ? 600 : 400;
+                    color: Tok.ink;
+                    wrap: word-wrap;
+                    min-height: 19px;
+                    vertical-alignment: center;
+                }
+                if root.mono != "": Text {
+                    text: root.mono;
+                    font-family: Tok.mono;
+                    font-size: 13.5px;
+                    font-weight: 600;
+                    color: Tok.ink;
+                    vertical-alignment: center;
+                }
+                if root.after != "": Text {
+                    text: root.after;
+                    font-size: 13.5px;
+                    color: Tok.ink;
+                    vertical-alignment: center;
+                }
+            }
+            if root.sub != "": Text {
+                text: root.sub;
+                font-size: 12px;
+                color: Tok.ink-3;
+                wrap: word-wrap;
+                min-height: 17px;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            @children
+        }
+    }
+    HLine { }
+}
+
+component Btn inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 33px;
+    width: t.preferred-width + 26px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: ta.has-hover && enabled ? Tok.ink-3 : Tok.line-2;
+    background: Tok.white;
+    opacity: enabled ? 1 : 0.5;
+    t := Text {
+        text: root.label;
+        font-size: 12.5px;
+        font-weight: 600;
+        color: Tok.ink;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Seg inherits Rectangle {
+    in property <[string]> items;
+    in property <int> current;
+    callback picked(int);
+    height: 32px;
+    background: Tok.bg-2;
+    border-radius: 7px;
+    for it[i] in root.items: Rectangle {
+        x: 2px + i * (root.width - 4px) / root.items.length;
+        y: 2px;
+        width: (root.width - 4px) / root.items.length;
+        height: root.height - 4px;
+        border-radius: 5px;
+        background: i == root.current ? Tok.white : transparent;
+        drop-shadow-blur: i == root.current ? 2px : 0px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #1c19171f;
+        Text {
+            text: it;
+            font-size: 12.5px;
+            font-weight: i == root.current ? 600 : 500;
+            color: i == root.current ? Tok.ink : Tok.ink-2;
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.picked(i);
+            }
+        }
+    }
+}
+
+component Combo inherits Rectangle {
+    in property <[Opt]> model;
+    in property <int> current: -1;
+    callback picked(int);
+    height: 34px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Tok.line-2;
+    background: Tok.white;
+    property <bool> has-value: root.current >= 0 && root.current < root.model.length;
+    Text {
+        x: 8px;
+        width: root.width - 32px;
+        text: root.has-value ? root.model[root.current].label : Strings.pick-device;
+        font-size: 13px;
+        font-weight: 500;
+        color: root.has-value ? Tok.ink : Tok.ink-3;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Path {
+        x: root.width - 18px;
+        width: 8px;
+        height: 5px;
+        commands: "M 0 0 L 4 4 L 8 0";
+        viewbox-width: 8;
+        viewbox-height: 5;
+        stroke: Tok.ink-2;
+        stroke-width: 1.5px;
+    }
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            popup.show();
+        }
+    }
+    popup := PopupWindow {
+        x: 0px;
+        y: root.height + 2px;
+        width: root.width;
+        // Long device lists scroll instead of running off the window.
+        height: min(root.model.length * 28px + 10px, 320px);
+        Rectangle {
+            background: Tok.white;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Tok.line-2;
+            drop-shadow-blur: 8px;
+            drop-shadow-offset-y: 2px;
+            drop-shadow-color: #1c191726;
+            clip: true;
+            Flickable {
+                x: 1px;
+                y: 1px;
+                width: parent.width - 2px;
+                height: parent.height - 2px;
+                content-height: root.model.length * 28px + 8px;
+                VerticalLayout {
+                    padding: 4px;
+                    for o[i] in root.model: Rectangle {
+                        height: 28px;
+                        border-radius: 4px;
+                        background: (ta.has-hover && o.enabled) || i == root.current ? Tok.bg-2 : transparent;
+                        Text {
+                            x: 6px;
+                            width: parent.width - 12px;
+                            text: o.label;
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: o.enabled ? Tok.ink : Tok.ink-3;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        ta := TouchArea {
+                            enabled: o.enabled;
+                            clicked => {
+                                root.picked(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component Field inherits Text {
+    font-size: 12px;
+    font-weight: 500;
+    color: Tok.ink-2;
+}
+
+component Cross inherits Path {
+    width: 12px;
+    height: 12px;
+    commands: "M 2 2 L 10 10 M 10 2 L 2 10";
+    viewbox-width: 12;
+    viewbox-height: 12;
+    stroke-width: 1.5px;
+}
+
+// One recorded key, the "+" box, or the "Set key" box of an empty row. Sized by its text.
+component KeyBox inherits Rectangle {
+    in property <string> label;
+    in property <bool> recording;
+    in property <bool> placeholder;
+    in property <bool> removable;
+    callback clicked();
+    callback remove();
+    height: 31px;
+    border-radius: 6px;
+    background: root.recording ? Tok.acc : Tok.line-2;
+    HorizontalLayout {
+        padding: 1px;
+        padding-bottom: root.placeholder || root.recording ? 1px : 2px;
+        Rectangle {
+            border-radius: 5px;
+            background: Tok.white;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.clicked();
+                }
+            }
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: root.removable ? 4px : 10px;
+                spacing: 2px;
+                Text {
+                    min-width: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    text: root.recording ? Strings.press-key : root.label;
+                    font-family: root.placeholder && !root.recording ? Tok.sans : Tok.mono;
+                    font-size: 12px;
+                    font-weight: root.placeholder ? 500 : 600;
+                    color: root.recording ? Tok.acc : root.placeholder ? Tok.ink-3 : Tok.ink;
+                }
+                if root.removable: Rectangle {
+                    width: 16px;
+                    accessible-role: button;
+                    accessible-label: Strings.remove-key;
+                    Cross {
+                        width: 8px;
+                        height: 8px;
+                        stroke: rm-ta.has-hover ? Tok.ink : Tok.ink-3;
+                        stroke-width: 1.2px;
+                    }
+                    rm-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.remove();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component Grip inherits Rectangle {
+    in property <color> ink;
+    width: 10px;
+    height: 14px;
+    for p in [{ x: 2, y: 2 }, { x: 8, y: 2 }, { x: 2, y: 7 }, { x: 8, y: 7 }, { x: 2, y: 12 }, { x: 8, y: 12 }]: Rectangle {
+        x: (p.x - 1.3) * 1px;
+        y: (p.y - 1.3) * 1px;
+        width: 2.6px;
+        height: 2.6px;
+        border-radius: 1.3px;
+        background: root.ink;
+    }
+}
+
+component KeysTab inherits VerticalLayout {
+    in property <[BindRow]> binds;
+    in property <[Opt]> out-devices;
+    in property <bool> osd;
+    in property <bool> also-comms;
+    in property <[NameRow]> names;
+    in-out property <bool> names-open;
+    callback record(int, int);
+    callback remove-key(int, int);
+    callback pick-device(int, int);
+    callback remove(int);
+    callback add();
+    callback set-osd(bool);
+    callback set-also-comms(bool);
+    callback nick-edited(int, string);
+    pure callback drop-index(int, length, length) -> int;
+    callback drop(int, length, length);
+    property <int> drag-from: -1;
+    property <int> drag-to: -1;
+    // Rows with an inline note are taller; the average keeps a drop near the pointer.
+    property <length> row-h: root.binds.length > 0 ? (list.height - 1px) / root.binds.length : 1px;
+
+    H2 { text: Strings.keys-tab; }
+    Rectangle { height: 4px; }
+    Sub { text: Strings.keys-help; }
+    Rectangle { height: 10px; }
+    list := VerticalLayout {
+        HLine { }
+        for b[i] in root.binds: Rectangle {
+            opacity: root.drag-from == i ? 0.4 : 1;
+            VerticalLayout {
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 10px;
+                    Rectangle {
+                        width: 20px;
+                        height: 34px;
+                        accessible-role: button;
+                        accessible-label: Strings.drag-hint;
+                        Grip { ink: grip-ta.has-hover || grip-ta.pressed ? Tok.ink : Tok.ink-3; }
+                        grip-ta := TouchArea {
+                            mouse-cursor: grab;
+                            pointer-event(e) => {
+                                if e.kind == PointerEventKind.down {
+                                    root.drag-from = i;
+                                    root.drag-to = i;
+                                } else if e.kind == PointerEventKind.up && root.drag-from == i {
+                                    root.drop(i, self.absolute-position.y - list.absolute-position.y + self.mouse-y, root.row-h);
+                                    root.drag-from = -1;
+                                    root.drag-to = -1;
+                                } else if e.kind == PointerEventKind.cancel {
+                                    root.drag-from = -1;
+                                    root.drag-to = -1;
+                                }
+                            }
+                            moved => {
+                                if root.drag-from == i {
+                                    root.drag-to = root.drop-index(i, self.absolute-position.y - list.absolute-position.y + self.mouse-y, root.row-h);
+                                }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+                        // Keeps the device column aligned while a row's keys fit.
+                        min-width: 160px;
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 6px;
+                            for k[j] in b.keys: KeyBox {
+                                accessible-role: button;
+                                accessible-label: Strings.rerecord-key + " " + k.label;
+                                label: k.label;
+                                recording: k.recording;
+                                removable: b.keys.length > 1;
+                                clicked => {
+                                    root.record(i, j);
+                                }
+                                remove => {
+                                    root.remove-key(i, j);
+                                }
+                            }
+                            if b.keys.length == 0: KeyBox {
+                                min-width: 110px;
+                                label: Strings.set-key;
+                                placeholder: true;
+                                recording: b.adding;
+                                clicked => {
+                                    root.record(i, -1);
+                                }
+                            }
+                            if b.keys.length > 0: KeyBox {
+                                label: "+";
+                                accessible-role: button;
+                                accessible-label: Strings.add-another-key;
+                                placeholder: true;
+                                recording: b.adding;
+                                clicked => {
+                                    root.record(i, -1);
+                                }
+                            }
+                        }
+                    }
+                    Combo {
+                        horizontal-stretch: 1;
+                        min-width: 170px;
+                        model: root.out-devices;
+                        current: b.device;
+                        picked(d) => {
+                            root.pick-device(i, d);
+                        }
+                    }
+                    VerticalLayout {
+                        width: 64px;
+                        alignment: center;
+                        Rectangle {
+                            height: 22px;
+                            border-radius: 4px;
+                            background: b.cycle != "" ? Tok.acc-soft : transparent;
+                            Text {
+                                text: b.cycle;
+                                font-size: 11px;
+                                font-weight: 600;
+                                color: Tok.acc;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 6px;
+                            background: x-ta.has-hover ? Tok.bg-2 : transparent;
+                            accessible-role: button;
+                            accessible-label: Strings.remove-row;
+                            Cross { stroke: x-ta.has-hover ? Tok.ink : Tok.ink-3; }
+                            x-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.remove(i);
+                                }
+                            }
+                        }
+                    }
+                }
+                if b.note != "": HorizontalLayout {
+                    padding-left: 30px;
+                    Text {
+                        text: b.note;
+                        font-size: 12px;
+                        color: Tok.warn;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            HLine { y: parent.height - 1px; }
+            // Drop marker: above the target row when moving up, below it when moving down.
+            if root.drag-from >= 0 && root.drag-to == i && root.drag-to != root.drag-from: Rectangle {
+                y: root.drag-to < root.drag-from ? 0px : parent.height - 2px;
+                height: 2px;
+                background: Tok.acc;
+            }
+        }
+    }
+    HorizontalLayout {
+        alignment: start;
+        padding-top: 10px;
+        add-t := Text {
+            text: Strings.add-key;
+            font-size: 13px;
+            font-weight: 600;
+            color: Tok.acc;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.add();
+                }
+            }
+        }
+    }
+    Rectangle { height: 22px; }
+    H2 { text: Strings.on-switch; }
+    Rectangle { height: 4px; }
+    SwRow {
+        first: true;
+        label: Strings.show-name;
+        sub: Strings.show-name-sub;
+        Toggle {
+            on: root.osd;
+            toggled(v) => {
+                root.set-osd(v);
+            }
+        }
+    }
+    SwRow {
+        label: Strings.switch-comms;
+        sub: Strings.switch-comms-sub;
+        Toggle {
+            on: root.also-comms;
+            toggled(v) => {
+                root.set-also-comms(v);
+            }
+        }
+    }
+    Rectangle { height: 16px; }
+    HLine { }
+    Rectangle { height: 10px; }
+    HorizontalLayout {
+        alignment: start;
+        spacing: 6px;
+        Path {
+            width: 8px;
+            height: 19px;
+            commands: root.names-open ? "M 0 2 L 8 2 L 4 7 Z" : "M 1 0 L 6 4.5 L 1 9 Z";
+            viewbox-width: 8;
+            viewbox-height: 9;
+            fill: Tok.ink-2;
+        }
+        Text {
+            text: Strings.device-names;
+            font-size: 13.5px;
+            font-weight: 600;
+            color: Tok.ink-2;
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.names-open = !root.names-open;
+                }
+            }
+        }
+    }
+    if root.names-open: VerticalLayout {
+        padding-top: 10px;
+        spacing: 6px;
+        for n[i] in root.names: HorizontalLayout {
+            spacing: 12px;
+            Text {
+                text: n.label;
+                font-size: 12.5px;
+                color: Tok.ink-2;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Rectangle {
+                width: 160px;
+                height: 31px;
+                border-radius: 6px;
+                border-width: input.has-focus ? 2px : 1px;
+                border-color: input.has-focus ? Tok.acc : Tok.line-2;
+                background: Tok.white;
+                input := TextInput {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    text: n.nick;
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: Tok.ink;
+                    vertical-alignment: center;
+                    single-line: true;
+                    selection-background-color: Tok.acc;
+                    selection-foreground-color: Tok.white;
+                    edited => {
+                        root.nick-edited(i, self.text);
+                    }
+                }
+            }
+        }
+    }
+}
+
+component GuardCol inherits VerticalLayout {
+    in property <string> title;
+    in property <[Opt]> devices;
+    in property <[Opt]> comms-devices;
+    in property <int> main;
+    in property <int> comms;
+    in property <int> mode;
+    callback pick-main(int);
+    callback pick-comms(int);
+    callback pick-mode(int);
+    H2 { text: root.title; }
+    Rectangle { height: 10px; }
+    Field { text: Strings.main-device; }
+    Rectangle { height: 4px; }
+    Combo {
+        model: root.devices;
+        current: root.main;
+        picked(i) => {
+            root.pick-main(i);
+        }
+    }
+    Rectangle { height: 10px; }
+    Field { text: Strings.comms-device; }
+    Rectangle { height: 4px; }
+    Combo {
+        model: root.comms-devices;
+        current: root.comms;
+        picked(i) => {
+            root.pick-comms(i);
+        }
+    }
+    Rectangle { height: 10px; }
+    Field { text: Strings.mode; }
+    Rectangle { height: 4px; }
+    Seg {
+        items: Strings.modes;
+        current: root.mode;
+        picked(i) => {
+            root.pick-mode(i);
+        }
+    }
+}
+
+component Stepper inherits Rectangle {
+    in property <int> value;
+    callback step(int);
+    width: 94px;
+    height: 29px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Tok.line-2;
+    background: Tok.white;
+    HorizontalLayout {
+        padding: 1px;
+        Rectangle {
+            width: 28px;
+            accessible-role: button;
+            accessible-label: Strings.decrease;
+            Path {
+                width: 8px;
+                height: 8px;
+                commands: "M 0 4 L 8 4";
+                viewbox-width: 8;
+                viewbox-height: 8;
+                stroke: Tok.ink-2;
+                stroke-width: 1.5px;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.step(-1);
+                }
+            }
+        }
+        Rectangle { width: 1px; background: Tok.line; }
+        Text {
+            width: 34px;
+            text: root.value;
+            font-family: Tok.mono;
+            font-size: 13px;
+            font-weight: 600;
+            color: Tok.ink;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        Rectangle { width: 1px; background: Tok.line; }
+        Rectangle {
+            width: 28px;
+            accessible-role: button;
+            accessible-label: Strings.increase;
+            Path {
+                width: 8px;
+                height: 8px;
+                commands: "M 0 4 L 8 4 M 4 0 L 4 8";
+                viewbox-width: 8;
+                viewbox-height: 8;
+                stroke: Tok.ink-2;
+                stroke-width: 1.5px;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.step(1);
+                }
+            }
+        }
+    }
+}
+
+// Flickable with a thin scrollbar thumb.
+component Scroll inherits Rectangle {
+    in property <length> body-height;
+    fl := Flickable {
+        // Wheel only: a press-and-drag belongs to the row grips.
+        interactive: false;
+        content-height: max(self.height, root.body-height);
+        @children
+    }
+    if fl.content-height > root.height: Rectangle {
+        x: root.width - 10px;
+        y: -fl.content-y * root.height / fl.content-height + 2px;
+        width: 8px;
+        height: root.height * root.height / fl.content-height - 4px;
+        border-radius: 4px;
+        background: Tok.line-2;
+    }
+}
+
+export component SettingsView inherits Window {
+    in property <string> win-title;
+    title: win-title;
+    icon: @image-url("../assets/swara-256.png");
+    width: 760px;
+    height: 488px;
+    background: Tok.bg;
+    default-font-family: Tok.sans;
+    default-font-size: 13.5px;
+
+    in-out property <int> tab: 0;
+    in property <string> error;
+    // Tombol
+    in property <[BindRow]> binds;
+    in property <[Opt]> out-devices;
+    in property <bool> osd;
+    in property <bool> also-comms;
+    in property <[NameRow]> names;
+    callback record(int, int);
+    callback remove-key(int, int);
+    callback pick-device(int, int);
+    callback remove(int);
+    callback add();
+    callback set-osd(bool);
+    callback set-also-comms(bool);
+    callback nick-edited(int, string);
+    pure callback drop-index(int, length, length) -> int;
+    callback drop(int, length, length);
+    // Penjaga
+    in property <bool> guard-enabled;
+    in property <[Opt]> in-devices;
+    // Guard main pickers: "None" first, then the devices.
+    in property <[Opt]> out-guard-devices;
+    in property <[Opt]> in-guard-devices;
+    in property <[Opt]> out-comms;
+    in property <[Opt]> in-comms;
+    in property <int> out-main: -1;
+    in property <int> out-comm: 0;
+    in property <int> out-mode;
+    in property <int> in-main: -1;
+    in property <int> in-comm: 0;
+    in property <int> in-mode;
+    in property <int> snooze: 15;
+    callback set-guard-enabled(bool);
+    callback guard-main(bool, int);
+    callback guard-comms(bool, int);
+    callback guard-mode(bool, int);
+    callback snooze-step(int);
+    // Umum
+    in property <int> lang;
+    in property <bool> autostart;
+    in property <bool> admin;
+    in property <bool> admin-available;
+    in property <string> admin-sub;
+    in property <string> version;
+    in property <string> update-line;
+    in property <string> update-button;
+    in property <bool> update-running;
+    callback set-lang(int);
+    callback set-autostart(bool);
+    callback set-admin(bool);
+    callback update-clicked();
+    callback open-link(int);
+
+    HorizontalLayout {
+        Rectangle {
+            width: 140px;
+            VerticalLayout {
+                padding-top: 14px;
+                padding-bottom: 14px;
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 2px;
+                alignment: start;
+                NavItem {
+                    label: Strings.keys-tab;
+                    active: root.tab == 0;
+                    clicked => {
+                        root.tab = 0;
+                    }
+                }
+                NavItem {
+                    label: Strings.guard-tab;
+                    active: root.tab == 1;
+                    clicked => {
+                        root.tab = 1;
+                    }
+                }
+                NavItem {
+                    label: Strings.general-tab;
+                    active: root.tab == 2;
+                    clicked => {
+                        root.tab = 2;
+                    }
+                }
+            }
+        }
+        Rectangle { width: 1px; background: Tok.line; }
+        main := Rectangle {
+            horizontal-stretch: 1;
+            property <length> body-w: min(520px, self.width - 56px);
+            if root.tab == 0: Scroll {
+                body-height: keys.preferred-height + 42px;
+                keys := KeysTab {
+                    x: 28px;
+                    y: 18px;
+                    width: main.body-w;
+                    height: self.preferred-height;
+                    binds: root.binds;
+                    out-devices: root.out-devices;
+                    osd: root.osd;
+                    also-comms: root.also-comms;
+                    names: root.names;
+                    record(i, j) => {
+                        root.record(i, j);
+                    }
+                    remove-key(i, j) => {
+                        root.remove-key(i, j);
+                    }
+                    pick-device(i, d) => {
+                        root.pick-device(i, d);
+                    }
+                    remove(i) => {
+                        root.remove(i);
+                    }
+                    add => {
+                        root.add();
+                    }
+                    set-osd(v) => {
+                        root.set-osd(v);
+                    }
+                    set-also-comms(v) => {
+                        root.set-also-comms(v);
+                    }
+                    nick-edited(i, s) => {
+                        root.nick-edited(i, s);
+                    }
+                    drop-index(i, y, h) => {
+                        return root.drop-index(i, y, h);
+                    }
+                    drop(i, y, h) => {
+                        root.drop(i, y, h);
+                    }
+                }
+            }
+            if root.tab == 1: Scroll {
+                body-height: guard.preferred-height + 42px;
+                guard := VerticalLayout {
+                    x: 28px;
+                    y: 18px;
+                    width: main.body-w;
+                    height: self.preferred-height;
+                    SwRow {
+                        first: true;
+                        strong: true;
+                        label: Strings.guard-on;
+                        sub: Strings.guard-on-sub;
+                        Toggle {
+                            on: root.guard-enabled;
+                            toggled(v) => {
+                                root.set-guard-enabled(v);
+                            }
+                        }
+                    }
+                    Rectangle { height: 16px; }
+                    HorizontalLayout {
+                        spacing: 20px;
+                        GuardCol {
+                            title: Strings.input;
+                            devices: root.in-guard-devices;
+                            comms-devices: root.in-comms;
+                            main: root.in-main;
+                            comms: root.in-comm;
+                            mode: root.in-mode;
+                            pick-main(i) => {
+                                root.guard-main(false, i);
+                            }
+                            pick-comms(i) => {
+                                root.guard-comms(false, i);
+                            }
+                            pick-mode(i) => {
+                                root.guard-mode(false, i);
+                            }
+                        }
+                        GuardCol {
+                            title: Strings.output;
+                            devices: root.out-guard-devices;
+                            comms-devices: root.out-comms;
+                            main: root.out-main;
+                            comms: root.out-comm;
+                            mode: root.out-mode;
+                            pick-main(i) => {
+                                root.guard-main(true, i);
+                            }
+                            pick-comms(i) => {
+                                root.guard-comms(true, i);
+                            }
+                            pick-mode(i) => {
+                                root.guard-mode(true, i);
+                            }
+                        }
+                    }
+                    Rectangle { height: 18px; }
+                    SwRow {
+                        first: true;
+                        label: Strings.snooze-label;
+                        sub: Strings.snooze-sub;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Stepper {
+                                value: root.snooze;
+                                step(d) => {
+                                    root.snooze-step(d);
+                                }
+                            }
+                            Text {
+                                text: Strings.minutes;
+                                color: Tok.ink;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+            if root.tab == 2: Scroll {
+                body-height: gen.preferred-height + 42px;
+                gen := VerticalLayout {
+                    x: 28px;
+                    y: 18px;
+                    width: main.body-w;
+                    height: self.preferred-height;
+                    H2 { text: Strings.language-title; }
+                    Rectangle { height: 12px; }
+                    HorizontalLayout {
+                        alignment: start;
+                        Seg {
+                            width: 320px;
+                            items: Strings.langs;
+                            current: root.lang;
+                            picked(i) => {
+                                root.set-lang(i);
+                            }
+                        }
+                    }
+                    Rectangle { height: 22px; }
+                    H2 { text: Strings.system; }
+                    Rectangle { height: 4px; }
+                    SwRow {
+                        first: true;
+                        label: Strings.run-at-startup;
+                        Toggle {
+                            on: root.autostart;
+                            toggled(v) => {
+                                root.set-autostart(v);
+                            }
+                        }
+                    }
+                    SwRow {
+                        label: Strings.run-as-admin;
+                        sub: root.admin-sub;
+                        Toggle {
+                            on: root.admin;
+                            enabled: root.admin-available;
+                            toggled(v) => {
+                                root.set-admin(v);
+                            }
+                        }
+                    }
+                    Rectangle { height: 12px; }
+                    Rectangle {
+                        background: Tok.bg-2;
+                        border-radius: 8px;
+                        VerticalLayout {
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            Text {
+                                text: Strings.league-bold;
+                                font-size: 12.5px;
+                                font-weight: 600;
+                                color: Tok.ink;
+                                wrap: word-wrap;
+                            }
+                            Sub { text: Strings.league-rest; }
+                        }
+                    }
+                    Rectangle { height: 22px; }
+                    H2 { text: Strings.update-support; }
+                    Rectangle { height: 4px; }
+                    SwRow {
+                        first: true;
+                        label: Strings.topup-row;
+                        Btn {
+                            label: Strings.topup;
+                            clicked => {
+                                root.open-link(2);
+                            }
+                        }
+                    }
+                    SwRow {
+                        label: Strings.version-prefix;
+                        mono: root.version;
+                        after: Strings.version-suffix;
+                        sub: root.update-line;
+                        HorizontalLayout {
+                            Btn {
+                                label: root.update-button;
+                                enabled: !root.update-running;
+                                clicked => {
+                                    root.update-clicked();
+                                }
+                            }
+                        }
+                    }
+                    SwRow {
+                        label: Strings.bug-row;
+                        Btn {
+                            label: Strings.bug;
+                            clicked => {
+                                root.open-link(3);
+                            }
+                        }
+                    }
+                    SwRow {
+                        label: Strings.kofi-row;
+                        Btn {
+                            label: Strings.kofi;
+                            clicked => {
+                                root.open-link(0);
+                            }
+                        }
+                    }
+                    SwRow {
+                        label: Strings.saweria-row;
+                        Btn {
+                            label: Strings.saweria;
+                            clicked => {
+                                root.open-link(1);
+                            }
+                        }
+                    }
+                }
+            }
+            if root.error != "": Rectangle {
+                y: parent.height - self.height;
+                height: err.preferred-height + 16px;
+                background: Tok.bg-2;
+                err := Text {
+                    x: 28px;
+                    width: parent.width - 56px;
+                    text: root.error;
+                    font-size: 12px;
+                    color: Tok.warn;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

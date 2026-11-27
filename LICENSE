@@ -1,0 +1,8 @@
+Copyright (c) 2026 Kurohiko. All rights reserved.
+
+The source code is published for reading and building. No permission is
+granted to copy, modify, or redistribute it without written permission.
+
+Third-party components keep their own licenses:
+- Slint (settings window): Slint Royalty-free License, https://slint.dev
+- Geist fonts: SIL Open Font License 1.1, see assets/fonts/OFL.txt
