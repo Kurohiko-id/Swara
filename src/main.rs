@@ -3,6 +3,13 @@
 use swara::{admin, app, log, settings, stats};
 
 fn main() {
+    // Release builds abort on panic, which would otherwise leave no trace of the cause.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::init();
+        log::line(&format!("panic: {info}"));
+        default_hook(info);
+    }));
     let mode = std::env::args().nth(1);
     let code = match mode.as_deref() {
         Some("--settings") => {

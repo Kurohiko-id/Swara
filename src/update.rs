@@ -1,12 +1,18 @@
 //! Update check against the latest GitHub release, verified download, silent install.
 
 use crate::http;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use windows::Win32::Security::Cryptography::{
     BCRYPT_HASH_HANDLE, BCRYPT_SHA256_ALG_HANDLE, BCryptCreateHash, BCryptDestroyHash,
     BCryptFinishHash, BCryptHashData,
 };
+
+const FILE_SHARE_READ: u32 = 0x1;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
 const DOWNLOAD_PREFIX: &str = "https://github.com/Kurohiko-id/Swara/releases/download/";
 
@@ -229,16 +235,90 @@ pub fn download_installer(
     if pick_asset(&check).is_none() {
         return Err("asset failed validation".into());
     }
-    let path = std::env::temp_dir().join(&asset.name);
-    let result = download_to(asset, &path, report);
+    let path = download_dir()?.join(&asset.name);
+    let result =
+        download_to(asset, &path, report).and_then(|()| lock_verified(&path, &asset.digest));
     if result.is_err() {
         let _ = std::fs::remove_file(&path);
     }
-    result.map(|()| VerifiedInstaller(path))
+    result.map(|lock| VerifiedInstaller { path, _lock: lock })
+}
+
+/// Picks the download folder. An elevated process must never run a file from a folder its user
+/// can redirect or rewrite (`%TEMP%` comes from that user's settings), so it only accepts the
+/// install folder under Program Files, which admins alone can write.
+fn choose_download_dir(
+    elevated: bool,
+    install_dir: Option<PathBuf>,
+    temp: PathBuf,
+) -> Result<PathBuf, String> {
+    match (elevated, install_dir) {
+        (false, _) => Ok(temp),
+        (true, Some(dir)) => Ok(dir),
+        (true, None) => Err("elevated update needs an install under Program Files".into()),
+    }
+}
+
+fn install_dir_if_protected() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    if !crate::admin::exe_under_program_files(&exe) {
+        return None;
+    }
+    exe.parent().map(Path::to_path_buf)
+}
+
+fn download_dir() -> Result<PathBuf, String> {
+    let elevated = crate::admin::running_elevated();
+    // The known-folder lookup is only needed for the elevated case.
+    let install_dir = if elevated {
+        install_dir_if_protected()
+    } else {
+        None
+    };
+    choose_download_dir(elevated, install_dir, std::env::temp_dir())
+}
+
+/// Reopens the finished download so no other process can write, replace or delete it, and
+/// hashes it again through that handle. This fixes the file's content; the folder it sits in
+/// is what `download_dir` protects.
+fn lock_verified(path: &Path, digest: &str) -> Result<File, String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        // Open a link itself instead of its target, so it can be refused below.
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| format!("installer lock: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("installer lock: {e}"))?;
+    if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("installer is not a plain file".into());
+    }
+    let mut hash = Sha256::new()?;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| format!("installer read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&chunk[..n])?;
+    }
+    verify_digest(&hash.finish()?, digest)?;
+    Ok(file)
 }
 
 fn download_to(asset: &Asset, path: &Path, report: &mut dyn FnMut(u64)) -> Result<(), String> {
-    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    // A name left or planted in %TEMP% (an old file, a link) is removed, never reused or followed.
+    let _ = std::fs::remove_file(path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|e| format!("installer file: {e}"))?;
     let mut hash = Sha256::new()?;
     let mut received = 0u64;
     let mut url = asset.url.clone();
@@ -278,13 +358,17 @@ fn download_to(asset: &Asset, path: &Path, report: &mut dyn FnMut(u64)) -> Resul
 }
 
 /// An installer whose SHA-256 matched its release digest. Only `download_installer` makes one,
-/// so `run_silent` cannot be handed an unchecked file.
+/// so `run_silent` cannot be handed an unchecked file. `_lock` keeps the file read-only for
+/// every other process until this value is dropped.
 #[derive(Debug)]
-pub struct VerifiedInstaller(PathBuf);
+pub struct VerifiedInstaller {
+    path: PathBuf,
+    _lock: File,
+}
 
 impl VerifiedInstaller {
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
@@ -295,27 +379,38 @@ fn is_installer_name(name: &str) -> bool {
         .is_some_and(|v| version(v).is_some())
 }
 
-/// Deletes installers left in %TEMP% by an earlier update. The running setup still holds
-/// its file during the update, so this runs at the next start instead.
+/// Deletes installers left behind by an earlier update, in %TEMP% and in the install folder
+/// under Program Files (where an elevated update puts them). The running setup still holds its
+/// file during the update, so this runs at the next start instead.
 pub fn remove_stale_installers() {
-    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for e in dir.flatten() {
-        // A symlink planted under such a name is removed itself, never its target.
-        if e.file_name().to_str().is_some_and(is_installer_name) {
-            let _ = std::fs::remove_file(e.path());
+    // Only an install folder: next to a portable exe (say, Downloads) such files are the user's.
+    for folder in [Some(std::env::temp_dir()), install_dir_if_protected()]
+        .into_iter()
+        .flatten()
+    {
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            // A symlink planted under such a name is removed itself, never its target.
+            if e.file_name().to_str().is_some_and(is_installer_name) {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
 }
 
 /// Starts the installer and returns without waiting for it.
 pub fn run_silent(installer: VerifiedInstaller) -> Result<(), String> {
-    std::process::Command::new(&installer.0)
+    let started = std::process::Command::new(installer.path())
         .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/UPDATE"])
         .spawn()
         .map(drop)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // Held across the spawn so the checked bytes are the ones that start. After that the file
+    // is safe only where the folder is: admin-only when elevated, the user's own otherwise.
+    drop(installer);
+    started
 }
 
 #[cfg(test)]
@@ -429,6 +524,63 @@ mod tests {
     }
 
     #[test]
+    fn locked_installer_cannot_be_swapped() {
+        let path = std::env::temp_dir().join(format!("swara-locktest-{}.bin", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let lock = lock_verified(&path, &sha_digest()).unwrap();
+        // While the lock is held nobody can rewrite, delete or move the checked file.
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::rename(&path, path.with_extension("moved")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        drop(lock);
+
+        // Changed content no longer passes, and a folder under the name is refused.
+        std::fs::write(&path, b"abd").unwrap();
+        assert!(lock_verified(&path, &sha_digest()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(lock_verified(&path, &sha_digest()).is_err());
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn elevated_downloads_only_into_the_install_folder() {
+        let temp = PathBuf::from(r"C:\Temp");
+        let install = PathBuf::from(r"C:\Program Files\Swara");
+        assert_eq!(
+            choose_download_dir(false, None, temp.clone()),
+            Ok(temp.clone())
+        );
+        assert_eq!(
+            choose_download_dir(false, Some(install.clone()), temp.clone()),
+            Ok(temp.clone())
+        );
+        assert_eq!(
+            choose_download_dir(true, Some(install.clone()), temp.clone()),
+            Ok(install)
+        );
+        assert!(choose_download_dir(true, None, temp).is_err());
+    }
+
+    #[test]
+    fn locked_file_can_still_be_started() {
+        let system = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+        let source = Path::new(&system).join("System32").join("whoami.exe");
+        let path = std::env::temp_dir().join(format!("swara-runtest-{}.exe", std::process::id()));
+        std::fs::copy(&source, &path).unwrap();
+        let mut hasher = Sha256::new().unwrap();
+        hasher.update(&std::fs::read(&path).unwrap()).unwrap();
+        let digest = format!("sha256:{}", hasher.finish().unwrap());
+
+        let lock = lock_verified(&path, &digest).unwrap();
+        let ran = std::process::Command::new(&path).output().unwrap();
+        assert!(ran.status.success());
+        drop(lock);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn hash_compare_is_strict_but_case_blind() {
         let mut hasher = Sha256::new().unwrap();
         hasher.update(b"ab").unwrap();
@@ -482,6 +634,23 @@ mod tests {
     fn queries_github_for_real() {
         let answer = latest_release();
         println!("latest release lookup: {answer:?}");
+    }
+
+    /// Network: downloads the latest real installer, without running it.
+    #[test]
+    #[ignore]
+    fn downloads_and_locks_for_real() {
+        let latest = latest_release().unwrap();
+        let asset = pick_asset(&latest).expect("release has a matching installer");
+        let mut seen = 0;
+        let installer = download_installer(asset, &mut |n| seen = n).unwrap();
+        let path = installer.path().to_path_buf();
+        println!("downloaded {seen} bytes to {}", path.display());
+        assert_eq!(seen, asset.size);
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(installer);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

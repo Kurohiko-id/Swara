@@ -97,6 +97,10 @@ Filename: "{app}\{#ExeName}"; Flags: nowait postinstall skipifsilent; Descriptio
 ; After a silent /UPDATE launched by the app, bring Swara back up.
 Filename: "{app}\{#ExeName}"; Check: StartedByUpdater; Flags: nowait runasoriginaluser
 
+[UninstallDelete]
+; An elevated self-update keeps its downloaded setup next to the exe.
+Type: files; Name: "{app}\Swara-Setup-*.exe"
+
 [Code]
 const
   StartupKey = 'Software\Microsoft\Windows\CurrentVersion\Run';

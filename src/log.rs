@@ -62,10 +62,34 @@ fn roll(logs: &Path, limit: u64, archives: usize) {
     let _ = fs::rename(&live, archive(logs, 1));
 }
 
+/// Empties the live file once it hits `limit` bytes. The handle is opened without following a
+/// link and checked to be a plain file, so the cut can only ever land on the log itself.
+fn cap_in_place(live: &Path, limit: u64) {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let Ok(file) = OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(live)
+    else {
+        return;
+    };
+    let Ok(meta) = file.metadata() else {
+        return;
+    };
+    let plain = meta.is_file() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+    if plain && meta.len() >= limit {
+        let _ = file.set_len(0);
+    }
+}
+
 fn write_entry(logs: &Path, msg: &str) {
     // Rolling renames files in a folder the user owns; an elevated process could be tricked
-    // into following a planted link, so it only appends.
-    if !crate::admin::running_elevated() {
+    // into following a planted link, so it empties the file in place instead.
+    if crate::admin::running_elevated() {
+        cap_in_place(&logs.join(LOG_NAME), ROLL_AT);
+    } else {
         roll(logs, ROLL_AT, ARCHIVES);
     }
     let file = OpenOptions::new()
@@ -140,5 +164,23 @@ mod tests {
         roll(&dir, 64, 3);
         assert!(dir.join(LOG_NAME).exists());
         assert!(!archive(&dir, 1).exists());
+    }
+
+    #[test]
+    fn cap_empties_only_a_full_plain_file() {
+        let dir = scratch("cap");
+        let live = dir.join(LOG_NAME);
+        fs::write(&live, "0123456789").unwrap();
+        cap_in_place(&live, 11);
+        assert_eq!(fs::read_to_string(&live).unwrap(), "0123456789");
+        cap_in_place(&live, 10);
+        assert_eq!(fs::metadata(&live).unwrap().len(), 0);
+        // Nothing is created, and a folder under that name is left alone.
+        cap_in_place(&dir.join("absent.log"), 0);
+        assert!(!dir.join("absent.log").exists());
+        let folder = dir.join("folder.log");
+        fs::create_dir(&folder).unwrap();
+        cap_in_place(&folder, 0);
+        assert!(folder.is_dir());
     }
 }

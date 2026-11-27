@@ -10,12 +10,17 @@ pub struct DeviceInfo {
     pub present: bool,
 }
 
-/// An id match wins even when absent so the caller can report that exact device as missing.
+/// A present id match wins. Next comes a present device of the same name, because endpoint ids
+/// change when a device moves to another port and the old id stays listed as absent. An absent
+/// id match is last, so the caller can still report that exact device as missing.
 pub fn resolve<'a>(r: &DeviceRef, list: &'a [DeviceInfo]) -> Option<&'a DeviceInfo> {
-    list.iter()
-        .find(|d| d.id == r.id)
-        // Endpoint ids change when a device is replugged into another port.
-        .or_else(|| list.iter().find(|d| d.present && d.name == r.name))
+    match list.iter().find(|d| d.id == r.id) {
+        Some(d) if d.present => Some(d),
+        absent => list
+            .iter()
+            .find(|d| d.present && d.name == r.name)
+            .or(absent),
+    }
 }
 
 pub fn display_name(info_name: &str, id: &str, nick: &BTreeMap<String, String>) -> String {
@@ -98,11 +103,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_id_match_wins_even_when_absent() {
+    fn resolve_prefers_present_same_name_over_absent_id() {
+        // Replugged into another port: the old id stays listed as absent.
         let list = [dev("a", "Headset", false), dev("n", "Headset", true)];
+        assert_eq!(resolve(&r("a", "Headset"), &list).unwrap().id, "n");
+        // A present id match still beats a same-named twin.
+        let twins = [dev("n", "Headset", true), dev("a", "Headset", true)];
+        assert_eq!(resolve(&r("a", "Headset"), &twins).unwrap().id, "a");
+    }
+
+    #[test]
+    fn resolve_keeps_absent_id_when_nothing_else_matches() {
+        let list = [dev("a", "Headset", false), dev("x", "Speakers", true)];
         let hit = resolve(&r("a", "Headset"), &list).unwrap();
         assert_eq!(hit.id, "a");
         assert!(!hit.present);
+    }
+
+    #[test]
+    fn replugged_device_stays_in_the_cycle() {
+        let refs = [r("a", "Headset"), r("b", "Speakers")];
+        let list = [
+            dev("a", "Headset", false),
+            dev("a2", "Headset", true),
+            dev("b", "Speakers", true),
+        ];
+        assert_eq!(next(&refs, &list, Some("b")).as_deref(), Some("a2"));
+        assert_eq!(next(&refs, &list, Some("a2")).as_deref(), Some("b"));
     }
 
     #[test]

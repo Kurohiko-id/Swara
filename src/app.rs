@@ -175,6 +175,9 @@ impl Core {
                 ),
             ),
         }
+        // A switch can outlast the dedup gap, and the twin message of this press (WM_HOTKEY or
+        // WM_INPUT) is handled only after it; measure the gap from the end of the work too.
+        self.last_fire = Some(Instant::now());
     }
 
     fn on_raw(&mut self, vk: u32, down: bool) {

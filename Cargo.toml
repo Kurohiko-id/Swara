@@ -1,6 +1,6 @@
 [package]
 name = "swara"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Audio output switcher for Windows: keyboard hotkeys, shortcuts, and a device guard."
 
